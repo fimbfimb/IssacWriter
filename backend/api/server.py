@@ -34,6 +34,8 @@ class ProfileIn(BaseModel):
     max_output_tokens: int = 32768
     price_in_per_m: float = 0.0
     price_out_per_m: float = 0.0
+    thinking: str = "default"
+    extra_params: Optional[Dict[str, Any]] = None
 
 
 class BookIn(BaseModel):
@@ -141,10 +143,12 @@ def create_app() -> FastAPI:
 
     @app.patch("/api/profiles/{profile_id}")
     def update_profile(profile_id: str, payload: ProfileIn):
-        existing = profile_or_404(profile_id)
+        existing = profile_or_404(profile_id) or {}
         data = payload.model_dump()
         if not data.get("api_key"):
             data["api_key"] = existing.get("api_key", "")
+        if data.get("extra_params") is None:
+            data["extra_params"] = existing.get("extra_params", {})
         profiles.update(profile_id, data)
         return {"profile": profiles.safe(profiles.get(profile_id))}
 

@@ -5,7 +5,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
-from ..llm.provider import LlmClient, ToolCall, Usage
+from ..llm.provider import LlmClient, ToolCall, Usage, sanitize_tool_call_arguments
 from .state import NarrativeState
 from .search_index import ChapterSearchIndex
 from .prompts import (
@@ -145,6 +145,8 @@ class ChapterWriter:
             )
             usage.prompt_tokens += response.usage.prompt_tokens
             usage.completion_tokens += response.usage.completion_tokens
+            if response.thinking_ignored:
+                await self._emit({"type": "thinking_ignored", "chapter_id": ch_id})
             await self._emit(
                 {
                     "type": "llm_usage",
@@ -195,7 +197,14 @@ class ChapterWriter:
 
             assistant_index = len(messages)
             tool_call_meta: List[Dict[str, Any]] = [
-                {"id": call.call_id, "name": call.name, "arguments": call.arguments}
+                {
+                    "id": call.call_id,
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": sanitize_tool_call_arguments(call.arguments),
+                    },
+                }
                 for call in response.tool_calls
             ]
             messages.append(
@@ -205,11 +214,11 @@ class ChapterWriter:
                     "content": response.content or "",
                 }
             )
-            for call in response.tool_calls:
-                name = call.name
+            for call, sanitized_meta in zip(response.tool_calls, tool_call_meta):
+                name = sanitized_meta["function"]["name"]
                 tool_counts[name] = tool_counts.get(name, 0) + 1
                 try:
-                    args = parse_tool_arguments(call.arguments)
+                    args = parse_tool_arguments(sanitized_meta["function"]["arguments"])
                 except Exception:
                     args = {}
                 payload, extras = await self._execute_tool(
@@ -330,7 +339,12 @@ class ChapterWriter:
             return
         assistant_msg = messages[assistant_index]
         tool_calls = assistant_msg.get("tool_calls") or []
-        write_call = next((tc for tc in tool_calls if tc["name"] == "write"), None)
+
+        def _call_name(tc: Dict[str, Any]) -> str:
+            function = tc.get("function")
+            return tc.get("name") or (function or {}).get("name") or ""
+
+        write_call = next((tc for tc in tool_calls if _call_name(tc) == "write"), None)
         if write_call is None:
             return
         args = parse_tool_arguments(write_call.get("arguments", "{}"))
@@ -341,7 +355,11 @@ class ChapterWriter:
             "word_count": count_words(content),
             "note": "rejected draft; its text was removed from history, word count retained",
         }
-        write_call["arguments"] = json.dumps(compact_args, ensure_ascii=False)
+        compact_json = json.dumps(compact_args, ensure_ascii=False)
+        if write_call.get("function") is not None:
+            write_call["function"]["arguments"] = compact_json
+        else:
+            write_call["arguments"] = compact_json
         for j in range(assistant_index + 1, min(assistant_index + 4, len(messages))):
             msg = messages[j]
             if msg.get("role") == "tool":

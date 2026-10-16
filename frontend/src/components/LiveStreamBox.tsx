@@ -54,6 +54,8 @@ export default function LiveStreamBox({
   consumedRef.current = events.length;
 
   const lastEvent = events[events.length - 1];
+  const lastDelta = [...events].reverse().find((e) => e.type === "llm_delta" && e.sent_at);
+  const quietSeconds = lastDelta?.sent_at ? Math.round(Date.now() / 1000 - lastDelta.sent_at) : null;
   const lastActivity = lastEvent?.sent_at ? `${Math.round(Date.now() / 1000 - lastEvent.sent_at)}s` : "—";
   const streamed = segmentsRef.current.reduce((sum, seg) => sum + seg.t.length, 0);
 
@@ -77,7 +79,8 @@ export default function LiveStreamBox({
         </strong>
         <span className="muted" style={{ fontSize: 11.5 }}>
           {streamed.toLocaleString()} Zeichen gesamt · letzte Aktivität vor {lastActivity}
-          {!active && " · (paused)"}
+          {quietSeconds != null && quietSeconds > 45 && active ? ` · still seit ${quietSeconds}s` : ""}
+          {active ? " · running" : " · idle"}
         </span>
       </div>
       <div

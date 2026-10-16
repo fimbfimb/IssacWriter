@@ -3,10 +3,180 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from openai import AsyncOpenAI
+
+_INLINE_THINKING = re.compile(r"<thinking>(?:.|\n)*?</thinking>", re.IGNORECASE)
+
+
+def strip_inline_thinking(text: str) -> str:
+    """Remove inline `<thinking>...</thinking>` blocks some servers emit inside content."""
+    if not text:
+        return text
+    cleaned = _INLINE_THINKING.sub("", text)
+    return cleaned.strip()
+
+
+def _next_significant(raw: str, index: int) -> Optional[str]:
+    while index < len(raw):
+        char = raw[index]
+        if not char.isspace():
+            return char
+        index += 1
+    return None
+
+
+def native_request_body(
+    profile: "LlmProfile",
+    messages: List[Dict[str, Any]],
+    tools: Optional[List[Dict[str, Any]]],
+    temperature: Optional[float],
+    max_output_tokens: Optional[int],
+) -> Dict[str, Any]:
+    """Build an Ollama-native `/api/chat` body from our OpenAI-style state."""
+    body: Dict[str, Any] = {
+        "model": profile.model,
+        "stream": True,
+        "temperature": profile.temperature if temperature is None else temperature,
+        "num_predict": max_output_tokens or profile.max_output_tokens,
+    }
+    native_messages: List[Dict[str, Any]] = []
+    for message in messages:
+        role = message.get("role")
+        if role == "assistant" and message.get("tool_calls"):
+            native_calls = []
+            for call in message["tool_calls"]:
+                function = call.get("function") or {}
+                name = function.get("name") or call.get("name")
+                raw_args = function.get("arguments", call.get("arguments", "{}"))
+                try:
+                    arguments = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                except Exception:
+                    arguments = {"_unparseable": str(raw_args)[:300]}
+                if name:
+                    native_calls.append({"function": {"name": name, "arguments": arguments}})
+            entry: Dict[str, Any] = {
+                "role": "assistant",
+                "content": str(message.get("content") or ""),
+            }
+            if native_calls:
+                entry["tool_calls"] = native_calls
+            native_messages.append(entry)
+            continue
+        entry = {
+            "role": role,
+            "content": str(message.get("content") or ""),
+        }
+        if role == "tool" and message.get("name"):
+            entry["tool_name"] = message["name"]
+        native_messages.append(entry)
+    body["messages"] = native_messages
+    if tools:
+        body["tools"] = [
+            {
+                "type": tool.get("type", "function"),
+                "function": tool.get("function"),
+            }
+            for tool in tools
+            if tool.get("function")
+        ]
+    level = (profile.thinking or "default").lower()
+    if level == "off":
+        body["think"] = False
+    elif level in ("low", "medium", "high"):
+        body["think"] = True
+    return body
+
+
+def native_chunk_event(obj: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize one Ollama-native JSONL chunk into a plain event dict."""
+    message = obj.get("message") or {}
+    tool_calls = []
+    for index, call in enumerate(message.get("tool_calls") or []):
+        function = call.get("function") or {}
+        arguments = function.get("arguments")
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments or {}, ensure_ascii=False)
+        tool_calls.append(
+            {"id": f"native-{index}", "name": function.get("name", ""), "arguments": arguments}
+        )
+    usage = None
+    if obj.get("done"):
+        usage = {
+            "prompt_tokens": int(obj.get("prompt_eval_count") or 0),
+            "completion_tokens": int(obj.get("eval_count") or 0),
+        }
+    return {
+        "content": message.get("content") or "",
+        "thinking": message.get("thinking") or "",
+        "tool_calls": tool_calls,
+        "done": bool(obj.get("done")),
+        "usage": usage,
+    }
+
+
+def sanitize_tool_call_arguments(raw: Any) -> str:
+    """Return provider-valid JSON for streamed tool-call arguments.
+
+    Some models emit literal control characters (raw newlines inside strings,
+    pretty-printed fragments) that are invalid JSON; providers then reject the
+    whole follow-up request with `invalid tool call arguments`. This repairs
+    control characters only inside string literals, then re-serializes
+    canonically. Unrepairable payloads become an explicit error object.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return "{}"
+    try:
+        return json.dumps(json.loads(raw), ensure_ascii=False)
+    except Exception:
+        pass
+
+    repaired_chars: List[str] = []
+    in_string = False
+    escaped = False
+    control_escapes = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+    for index, char in enumerate(raw):
+        if in_string:
+            if escaped:
+                repaired_chars.append(char)
+                escaped = False
+                continue
+            if char == "\\":
+                repaired_chars.append(char)
+                escaped = True
+                continue
+            if char == '"':
+                # Decide whether this quote closes the string: only when the next
+                # non-whitespace character is a structural token. An embedded quote
+                # followed by prose (e.g. `with "quote"` inside a value) is escaped.
+                look = _next_significant(raw, index + 1)
+                if look is not None and look not in ",}]:)":
+                    repaired_chars.append('\\"')
+                    index += 1
+                    continue
+                repaired_chars.append(char)
+                in_string = False
+                continue
+            if ord(char) < 0x20:
+                replaced = control_escapes.get(char) or "\\u%04x" % ord(char)
+                repaired_chars.append(replaced)
+                continue
+            repaired_chars.append(char)
+            continue
+        if char == '"':
+            repaired_chars.append(char)
+            in_string = True
+            continue
+        repaired_chars.append(char)
+    repaired = "".join(repaired_chars)
+    try:
+        return json.dumps(json.loads(repaired), ensure_ascii=False)
+    except Exception:
+        return json.dumps(
+            {"unparseable": True, "excerpt": raw[:300]}, ensure_ascii=False
+        )
 
 
 class LlmError(Exception):
@@ -52,6 +222,7 @@ class LlmResponse:
     tool_calls: List[ToolCall] = field(default_factory=list)
     finish_reason: str = "stop"
     usage: Usage = field(default_factory=Usage)
+    thinking_ignored: bool = False
 
 
 @dataclass
@@ -65,6 +236,8 @@ class LlmProfile:
     max_output_tokens: int = 32768
     price_in_per_m: float = 0.0
     price_out_per_m: float = 0.0
+    thinking: str = "default"
+    extra_params: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self, hide_key: bool = True) -> Dict[str, Any]:
         key = "***" if (hide_key and self.api_key) else self.api_key
@@ -79,7 +252,62 @@ class LlmProfile:
             "max_output_tokens": self.max_output_tokens,
             "price_in_per_m": self.price_in_per_m,
             "price_out_per_m": self.price_out_per_m,
+            "thinking": self.thinking,
+            "extra_params": self.extra_params,
         }
+
+    def thinking_kwargs(self) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Map the thinking setting onto provider-specific request parameters.
+
+        Returns (sdk_kwargs, extra_body). ``sdk_kwargs`` holds OpenAI-SDK-native
+        fields such as ``reasoning_effort``; ``extra_body`` carries raw
+        provider-scheme keys (Ollama ``think``, OpenRouter ``reasoning``) and the
+        user's free-form ``extra_params``. Empty dicts mean "no special params".
+        """
+        level = (self.thinking or "default").lower()
+        sdk: Dict[str, Any] = {}
+        extra: Dict[str, Any] = dict(self.extra_params or {})
+        if level == "default" and not extra:
+            return {}, {}
+        base = (self.base_url or "").lower()
+        openrouter = "openrouter.ai" in base
+        ollama = "ollama" in base or ":11434" in base
+        if level in ("low", "medium", "high"):
+            if openrouter:
+                extra.setdefault("reasoning", {"effort": level})
+            else:
+                sdk["reasoning_effort"] = level
+        elif level == "off":
+            if openrouter:
+                existing = extra.get("reasoning") if isinstance(extra.get("reasoning"), dict) else {}
+                extra["reasoning"] = {**existing, "exclude": True}
+            elif ollama:
+                extra["think"] = False
+            # Generic OpenAI-compatible servers have no off-switch; leaving the
+            # params empty lets the model use its default behavior.
+        return sdk, extra
+
+
+def _thinking_params_rejected(exc: Exception, sdk_params: Dict[str, Any], extra_params: Dict[str, Any]) -> bool:
+    text = str(exc).lower()
+    try:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    except Exception:
+        status = None
+    if status is not None and status != 400:
+        return False
+    keys = [str(k) for k in list(sdk_params) + list(extra_params)]
+    if keys and all(k.lower() in text for k in keys):
+        return True
+    signals = (
+        "unrecognized",
+        "unknown field",
+        "unknown parameter",
+        "not supported",
+        "extra_forbidden",
+        "extra fields",
+    )
+    return any(s in text for s in signals)
 
 
 class LlmClient:
@@ -91,6 +319,99 @@ class LlmClient:
             max_retries=0,
             timeout=httpx.Timeout(900.0, read=900.0, write=600.0, connect=30.0),
         )
+        self._http = httpx.AsyncClient(
+            timeout=httpx.Timeout(900.0, read=900.0, write=600.0, connect=30.0)
+        )
+
+    def _is_ollama(self) -> bool:
+        base = (self.profile.base_url or "").lower()
+        return "ollama" in base or ":11434" in base
+
+    def _use_native(self) -> bool:
+        override = (self.profile.extra_params or {}).get("use_native")
+        if override is not None:
+            return bool(override)
+        return self._is_ollama() and (self.profile.thinking or "default") != "default"
+
+    def _native_endpoint(self) -> str:
+        base = (self.profile.base_url or "").rstrip("/")
+        if base.endswith("/v1"):
+            base = base[: -len("/v1")]
+        return base + "/api/chat"
+
+    async def _ollama_native_chat(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        tool_choice: Optional[str],
+        temperature: Optional[float],
+        max_output_tokens: Optional[int],
+        on_delta: Optional[Any],
+    ) -> LlmResponse:
+        """Talk to Ollama's native /api/chat (supports the think knob reliably)."""
+        body = native_request_body(self.profile, messages, tools, temperature, max_output_tokens)
+        content_parts: List[str] = []
+        reasoning_parts: List[str] = []
+        tool_calls: List[ToolCall] = []
+        usage = Usage()
+        usage.price_in_per_m = self.profile.price_in_per_m
+        usage.price_out_per_m = self.profile.price_out_per_m
+        usage.estimated = True
+        finish_reason = "stop"
+        async with self._http.stream("POST", self._native_endpoint(), json=body) as response:
+            if response.status_code != 200:
+                raw = (await response.aread()).decode("utf-8", "ignore")
+                raise LlmError(f"Ollama native error {response.status_code}: {raw[:300]}", status_code=response.status_code)
+            async for line in response.aiter_lines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                event = native_chunk_event(obj)
+                if event["thinking"]:
+                    reasoning_parts.append(event["thinking"])
+                    if on_delta is not None:
+                        await on_delta("reasoning", event["thinking"])
+                if event["content"]:
+                    content_parts.append(event["content"])
+                    if on_delta is not None:
+                        await on_delta("content", event["content"])
+                for call_entry in event["tool_calls"]:
+                    if on_delta is not None and call_entry["arguments"]:
+                        await on_delta("tool_args", call_entry["arguments"])
+                    tool_calls.append(
+                        ToolCall(call_id=call_entry["id"], name=call_entry["name"], arguments=call_entry["arguments"])
+                    )
+                if event["done"]:
+                    if event["usage"]:
+                        usage.prompt_tokens = event["usage"]["prompt_tokens"]
+                        usage.completion_tokens = event["usage"]["completion_tokens"]
+                        usage.estimated = False
+                    if tool_calls:
+                        finish_reason = "tool_calls"
+                    break
+        content = strip_inline_thinking("".join(content_parts).strip())
+        if not content:
+            content = strip_inline_thinking("".join(reasoning_parts).strip())
+        return LlmResponse(
+            content=content,
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
+            usage=usage,
+        )
+
+    def _apply_thinking(self, kwargs: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        sdk_params, extra_params = self.profile.thinking_kwargs()
+        if sdk_params:
+            kwargs.update(sdk_params)
+        if extra_params:
+            merged = dict(kwargs.get("extra_body") or {})
+            merged.update(extra_params)
+            kwargs["extra_body"] = merged
+        return sdk_params, extra_params
 
     async def chat(
         self,
@@ -101,6 +422,10 @@ class LlmClient:
         max_output_tokens: Optional[int] = None,
         on_delta: Optional[Any] = None,
     ) -> LlmResponse:
+        if self._use_native():
+            return await self._ollama_native_chat(
+                messages, tools, tool_choice, temperature, max_output_tokens, on_delta
+            )
         if on_delta is not None:
             return await self._chat_stream(
                 messages, tools, tool_choice, temperature, max_output_tokens, on_delta
@@ -116,17 +441,29 @@ class LlmClient:
             kwargs["tools"] = tools
             if tool_choice:
                 kwargs["tool_choice"] = tool_choice
+        sdk_params, _ = self._apply_thinking(kwargs)
         try:
             response = await self._client.chat.completions.create(**kwargs)
+            thinking_ignored = False
         except Exception as exc:
-            status = getattr(getattr(exc, "response", None), "status_code", None)
-            raise LlmError(str(exc), status_code=status) from exc
+            if not _thinking_params_rejected(exc, sdk_params, {}):
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                raise LlmError(str(exc), status_code=status) from exc
+            stripped = {k: v for k, v in kwargs.items() if k != "reasoning_effort"}
+            if stripped.get("extra_body"):
+                stripped.pop("extra_body")
+            try:
+                response = await self._client.chat.completions.create(**stripped)
+                thinking_ignored = True
+            except Exception as retry_exc:
+                status = getattr(getattr(retry_exc, "response", None), "status_code", None)
+                raise LlmError(str(retry_exc), status_code=status) from retry_exc
         choice = response.choices[0]
         message = choice.message
         content = (message.content or "").strip()
+        content = strip_inline_thinking(content)
         if not content and hasattr(message, "reasoning_content") and message.reasoning_content:
-            reasoning = message.reasoning_content or ""
-            content = reasoning.split("</think>", 1)[1].strip() if "</think>" in reasoning else reasoning.strip()
+            content = strip_inline_thinking(message.reasoning_content or "")
         tool_calls: List[ToolCall] = []
         for call in message.tool_calls or []:
             tool_calls.append(
@@ -147,6 +484,7 @@ class LlmClient:
             tool_calls=tool_calls,
             finish_reason=choice.finish_reason or "stop",
             usage=usage,
+            thinking_ignored=thinking_ignored,
         )
 
     async def list_models(self) -> List[str]:
@@ -177,8 +515,10 @@ class LlmClient:
             kwargs["tools"] = tools
             if tool_choice:
                 kwargs["tool_choice"] = tool_choice
+        sdk_params, _ = self._apply_thinking(kwargs)
 
         stream = None
+        thinking_ignored = False
         try:
             try:
                 stream = await self._client.chat.completions.create(**kwargs)
@@ -186,6 +526,11 @@ class LlmClient:
                 if "stream_options" in str(first_error):
                     kwargs.pop("stream_options", None)
                     stream = await self._client.chat.completions.create(**kwargs)
+                elif _thinking_params_rejected(first_error, sdk_params, {}):
+                    stripped = {k: v for k, v in kwargs.items() if k != "reasoning_effort"}
+                    stripped.pop("extra_body", None)
+                    thinking_ignored = True
+                    stream = await self._client.chat.completions.create(**stripped)
                 else:
                     raise
         except Exception as exc:
@@ -242,8 +587,9 @@ class LlmClient:
                     await result
 
         content = "".join(content_parts).strip()
+        content = strip_inline_thinking(content)
         if not content:
-            content = "".join(reasoning_parts).strip()
+            content = strip_inline_thinking("".join(reasoning_parts).strip())
         tool_calls: List[ToolCall] = []
         for index in sorted(calls):
             entry = calls[index]
@@ -275,6 +621,7 @@ class LlmClient:
             tool_calls=tool_calls,
             finish_reason=finish_reason,
             usage=usage,
+            thinking_ignored=thinking_ignored,
         )
 
 

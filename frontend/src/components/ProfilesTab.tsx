@@ -10,9 +10,11 @@ const PRESETS: { name: string; base_url: string; price_in_per_m: number; price_o
   { name: "DeepSeek", base_url: "https://api.deepseek.com/v1", price_in_per_m: 0.27, price_out_per_m: 1.1 },
 ];
 
+type EditableProfile = Partial<Profile> & { extra_params_json?: string };
+
 export default function ProfilesTab({ showToast }: { showToast: (m: string) => void }) {
   const [profiles, setProfiles] = useState<Profile[]>([]);
-  const [editing, setEditing] = useState<Partial<Profile> | null>(null);
+  const [editing, setEditing] = useState<EditableProfile | null>(null);
   const [models, setModels] = useState<Record<string, string[]>>({});
 
   const refresh = () =>
@@ -25,11 +27,37 @@ export default function ProfilesTab({ showToast }: { showToast: (m: string) => v
     refresh();
   }, []);
 
-  const startNew = () => setEditing({ name: "", base_url: "http://localhost:11434/v1", api_key: "", model: "", temperature: 0.7, max_output_tokens: 32768, price_in_per_m: 0, price_out_per_m: 0 });
+  const startNew = () =>
+    setEditing({
+      name: "",
+      base_url: "http://localhost:11434/v1",
+      api_key: "",
+      model: "",
+      temperature: 0.7,
+      max_output_tokens: 32768,
+      price_in_per_m: 0,
+      price_out_per_m: 0,
+      thinking: "default",
+      extra_params: {},
+    });
 
   const saveProfile = async () => {
     if (!editing) return;
-    const data = {
+    let extraParams: Record<string, any> = {};
+    const rawExtra = (editing.extra_params_json ?? "").trim();
+    if (rawExtra) {
+      try {
+        extraParams = JSON.parse(rawExtra);
+      } catch {
+        showToast("Extra params must be valid JSON, e.g. {\"top_p\": 0.9}");
+        return;
+      }
+      if (typeof extraParams !== "object" || Array.isArray(extraParams)) {
+        showToast("Extra params must be a JSON object");
+        return;
+      }
+    }
+    const data: any = {
       name: editing.name ?? "",
       base_url: editing.base_url ?? "",
       api_key: editing.api_key ?? "",
@@ -38,6 +66,8 @@ export default function ProfilesTab({ showToast }: { showToast: (m: string) => v
       max_output_tokens: Number(editing.max_output_tokens ?? 32768),
       price_in_per_m: Number(editing.price_in_per_m ?? 0),
       price_out_per_m: Number(editing.price_out_per_m ?? 0),
+      thinking: editing.thinking ?? "default",
+      extra_params: extraParams,
     };
     try {
       if (editing.id) {
@@ -98,6 +128,11 @@ export default function ProfilesTab({ showToast }: { showToast: (m: string) => v
             <div key={profile.id} className="settings-row">
               <span>
                 {profile.name} {profile.api_key_set ? <span style={{ color: "var(--good)", fontSize: 10 }}>🔑</span> : null}
+                {profile.thinking && profile.thinking !== "default" && (
+                  <span className="chip" style={{ marginLeft: 6 }}>
+                    think: {profile.thinking}
+                  </span>
+                )}
               </span>
               <span className="muted" style={{ fontSize: 12, overflow: "hidden", textOverflow: "ellipsis" }}>
                 {profile.base_url}
@@ -225,6 +260,27 @@ export default function ProfilesTab({ showToast }: { showToast: (m: string) => v
                   step={0.001}
                   value={editing.price_out_per_m ?? 0}
                   onChange={(e) => setEditing({ ...editing, price_out_per_m: Number(e.target.value) })}
+                />
+              </div>
+            </div>
+            <div className="form-row">
+              <div className="form-col">
+                <label>Thinking (reasoning)</label>
+                <select value={editing.thinking ?? "default"} onChange={(e) => setEditing({ ...editing, thinking: e.target.value })}>
+                  <option value="default">Model default</option>
+                  <option value="off">Off — no thinking (fastest)</option>
+                  <option value="low">Low</option>
+                  <option value="medium">Standard</option>
+                  <option value="high">High (deep, slow, expensive)</option>
+                </select>
+              </div>
+              <div className="form-col">
+                <label>Extra params (JSON, provider-specific)</label>
+                <textarea
+                  rows={2}
+                  value={editing.extra_params_json ?? JSON.stringify(editing.extra_params ?? {})}
+                  onChange={(e) => setEditing({ ...editing, extra_params_json: e.target.value })}
+                  placeholder='{"top_p": 0.9, "repeat_penalty": 1.1}'
                 />
               </div>
             </div>

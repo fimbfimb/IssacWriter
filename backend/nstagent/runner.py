@@ -104,8 +104,23 @@ class BookRunner:
     async def _emit(self, event: Dict[str, Any]) -> None:
         event["sent_at"] = _now()
         self._last_event_at = event["sent_at"]
+        self._append_event_log(event)
         for queue in list(self._subscribers):
             queue.put_nowait(dict(event))
+
+    def _append_event_log(self, event: Dict[str, Any]) -> None:
+        """Persist every event so retry reasons survive browser disconnects and restarts."""
+        try:
+            log_path = self.store.root / self.book_id / "runs" / "events.jsonl"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            if log_path.exists() and log_path.stat().st_size > 8_000_000:
+                previous = log_path.with_suffix(".prev.jsonl")
+                previous.unlink(missing_ok=True)
+                log_path.rename(previous)
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
 
     def _set_status(self, status: str, error: Optional[str] = None) -> None:
         self.status = status

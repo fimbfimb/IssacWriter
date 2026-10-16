@@ -32,7 +32,7 @@ def default_run_settings() -> Dict[str, Any]:
     return {
         "mode": "auto",
         "temperature": 0.7,
-        "dynamic_tokens": True,
+        "dynamic_tokens": False,
         "hard_max_output_tokens": 32768,
         "max_turns": 50,
         "max_attempts_per_chapter": 2,

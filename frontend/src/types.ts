@@ -9,6 +9,8 @@ export type Profile = {
   max_output_tokens: number;
   price_in_per_m: number;
   price_out_per_m: number;
+  thinking: string;
+  extra_params: Record<string, any>;
 };
 
 export type CodexEntry = {

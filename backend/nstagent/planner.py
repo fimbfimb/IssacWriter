@@ -142,6 +142,8 @@ class OutlineBuilder:
                 max_output_tokens=self.max_stage_tokens,
                 on_delta=None if self.delta_sink is None else self._relay,
             )
+            if response.thinking_ignored:
+                await self._emit({"type": "thinking_ignored", "stage": stage_name})
             await self._emit(
                 {
                     "type": "planner_usage",

@@ -42,6 +42,8 @@ function formatEvent(event: any): { time: string; html: string } {
   if (event.type === "llm_usage")
     return { time, html: `tokens: ${event.usage.prompt_tokens} in / ${event.usage.completion_tokens} out` };
   if (event.type === "runner_status") return { time, html: `Runner: ${safe(event.status)}` };
+  if (event.type === "thinking_ignored")
+    return { time, html: `<span style="color: var(--warn)">⚠ provider rejected the thinking setting — fell back to model default</span>` };
   if (event.type === "runner_error")
     return { time, html: `<span class="ev-fail">⚠ runner error: ${safe(event.error)}</span>` };
   if (event.type === "runner_stopped") return { time, html: "Runner stopped" };

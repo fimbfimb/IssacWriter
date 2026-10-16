@@ -1,0 +1,119 @@
+import { useCallback, useEffect, useState } from "react";
+import { api, openEventStream } from "../api";
+import type { Book } from "../types";
+import OutlineTab from "../components/OutlineTab";
+import CodexTab from "../components/CodexTab";
+import WriteTab from "../components/WriteTab";
+import StatsTab from "../components/StatsTab";
+import ProfilesTab from "../components/ProfilesTab";
+
+type TabName = "outline" | "write" | "codex" | "stats" | "models";
+
+export default function BookPage({
+  bookId,
+  onBack,
+  showToast,
+}: {
+  bookId: string;
+  onBack: () => void;
+  showToast: (m: string) => void;
+}) {
+  const [book, setBook] = useState<Book | null>(null);
+  const [tab, setTab] = useState<TabName>("outline");
+  const [events, setEvents] = useState<any[]>([]);
+  const [runnerTick, setRunnerTick] = useState(0);
+
+  const refreshBook = useCallback(async () => {
+    try {
+      const result = await api.getBook(bookId);
+      setBook(result.book);
+    } catch (err: any) {
+      showToast(err.message);
+    }
+  }, [bookId]);
+
+  useEffect(() => {
+    refreshBook();
+  }, [bookId]);
+
+  useEffect(() => {
+    const close = openEventStream(bookId, (event) => {
+      setEvents((prev) => [...prev.slice(-500), event]);
+      setRunnerTick((t) => t + 1);
+      if (["outline_done", "chapter_done", "runner_stopped", "runner_error"].includes(event.type)) {
+        refreshBook();
+      }
+    });
+    return () => close();
+  }, [bookId]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      api.runStatus(bookId).then((r) => setBook((prev) => (prev ? { ...prev, runner: r.status } : prev))).catch(() => {});
+    }, 4000);
+    return () => window.clearInterval(timer);
+  }, [bookId, runnerTick]);
+
+  if (!book) return <div className="muted">Loading book…</div>;
+
+  const runnerStatus = book.runner?.status ?? "idle";
+  const words = book.words_written ?? 0;
+  const coverage = Math.min(100, (words / Math.max(1, book.target_words)) * 100);
+
+  return (
+    <div>
+      <div className="card" style={{ display: "flex", justifyContent: "space-between", gap: 18, alignItems: "center" }}>
+        <div>
+          <h2 style={{ margin: "0 0 6px" }}>{book.title}</h2>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+            <span className={`chip status-${runnerStatus}`}>{runnerStatus.replace("_", " ")}</span>
+            <span className="chip">{book.language.toUpperCase()}</span>
+            <span className="chip">
+              {words.toLocaleString()} / {book.target_words.toLocaleString()} words
+            </span>
+            <span className="chip">{book.chapters_written ?? 0} chapters written</span>
+            <span className="chip">{book.outline?.frozen ? "outline frozen" : "outline open"}</span>
+            <span className="chip">{book.run_settings?.mode === "review" ? "review per chapter" : "full auto"}</span>
+          </div>
+          <div className="progress-outer" style={{ maxWidth: 420 }}>
+            <div className="progress-inner" style={{ width: `${coverage.toFixed(1)}%` }} />
+          </div>
+        </div>
+        <button onClick={onBack}>← Library</button>
+      </div>
+
+      {book.runner?.error && (
+        <div className="error-banner">Runner error: {book.runner.error}</div>
+      )}
+      {book.last_error && !book.runner?.error && (
+        <div className="error-banner">Last error: {book.last_error}</div>
+      )}
+
+      <div className="tabs">
+        <button className={`tab ${tab === "outline" ? "active" : ""}`} onClick={() => setTab("outline")}>
+          Outline
+        </button>
+        <button className={`tab ${tab === "write" ? "active" : ""}`} onClick={() => setTab("write")}>
+          Write
+        </button>
+        <button className={`tab ${tab === "codex" ? "active" : ""}`} onClick={() => setTab("codex")}>
+          Codex
+        </button>
+        <button className={`tab ${tab === "stats" ? "active" : ""}`} onClick={() => setTab("stats")}>
+          Statistics
+        </button>
+        <button className={`tab ${tab === "models" ? "active" : ""}`} onClick={() => setTab("models")}>
+          LLM Profiles
+        </button>
+      </div>
+
+      {tab === "outline" && <OutlineTab book={book} events={events} refreshBook={refreshBook} showToast={showToast} />}
+      {tab === "write" && (
+        <WriteTab book={book} events={events} refreshBook={refreshBook} showToast={showToast} />
+      )}
+      {tab === "codex" && <CodexTab book={book} refreshBook={refreshBook} showToast={showToast} />}
+      {tab === "stats" && <StatsTab book={book} showToast={showToast} />}
+      {tab === "models" && <ProfilesTab showToast={showToast} />}
+    </div>
+  );
+}

@@ -1,0 +1,33 @@
+{
+  "character_states": [
+    {
+      "id": 1,
+      "name": "Marta Voss (aliases",
+      "description": "Marta Voss (aliases stands amid the storm at the Old Harbor, guarding secrets."
+    },
+    {
+      "id": 2,
+      "name": "Ivo Krane (aliases",
+      "description": "Ivo Krane (aliases stands amid the storm at the Old Harbor, guarding secrets."
+    },
+    {
+      "id": 3,
+      "name": "Edda Grimm (aliases",
+      "description": "Edda Grimm (aliases stands amid the storm at the Old Harbor, guarding secrets."
+    }
+  ],
+  "past_events": [
+    {
+      "id": 1,
+      "key": "ev_ch0",
+      "description": "Chapter 0 ended with the ledger revealed on the rope street."
+    }
+  ],
+  "future_requirements": [
+    {
+      "id": 1,
+      "key": "req_ch0",
+      "description": "Marta must open the sealed ledger before the storm ends."
+    }
+  ]
+}

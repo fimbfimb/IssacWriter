@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import List, Dict, Any, Optional
 
 WORD_COUNT_TOLERANCE = 0.20
@@ -57,7 +58,7 @@ def recommend_chapter_count(word_count: int) -> int:
             if w1 == w0:
                 return c0
             ratio = (word_count - w0) / (w1 - w0)
-            return max(1, round(c0 + ratio * (c1 - c0)))
+            return max(1, math.ceil(c0 + ratio * (c1 - c0)))
     return anchors[-1][1]
 
 

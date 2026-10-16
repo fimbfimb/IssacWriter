@@ -1,0 +1,35 @@
+{
+  "5641e4b1": {
+    "name": "Mock Local",
+    "base_url": "http://127.0.0.1:9393/v1",
+    "api_key": "mock-key",
+    "model": "mock-storyforge",
+    "temperature": 0.7,
+    "max_output_tokens": 32768,
+    "price_in_per_m": 0.0,
+    "price_out_per_m": 0.0,
+    "id": "5641e4b1"
+  },
+  "30018dfa": {
+    "name": "Mock Local",
+    "base_url": "http://127.0.0.1:9393/v1",
+    "api_key": "mock-key",
+    "model": "mock-storyforge",
+    "temperature": 0.7,
+    "max_output_tokens": 32768,
+    "price_in_per_m": 0.0,
+    "price_out_per_m": 0.0,
+    "id": "30018dfa"
+  },
+  "f5b5730e": {
+    "name": "Mock Local",
+    "base_url": "http://127.0.0.1:9393/v1",
+    "api_key": "mock-key",
+    "model": "mock-storyforge",
+    "temperature": 0.7,
+    "max_output_tokens": 32768,
+    "price_in_per_m": 0.0,
+    "price_out_per_m": 0.0,
+    "id": "f5b5730e"
+  }
+}

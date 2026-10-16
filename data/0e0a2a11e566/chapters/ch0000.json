@@ -1,0 +1,48 @@
+{
+  "id": 0,
+  "name": "Chapter 1: Ledger Debts",
+  "content": "dawn silence wharf storm storm cold wharf silence rope salt ledger salt harbor wharf cold grey cold salt grey cold ledger salt cold bottle harbor grey fog bottle rope ledger fog storm silence wharf ledger silence rope wharf harbor cold rope grey dawn storm cold silence rope salt rope rope cold bottle silence bottle storm ledger cold grey bottle ledger salt harbor grey salt bottle harbor dawn cold dawn fog salt bottle rope harbor rope grey grey harbor salt storm dawn cold grey harbor harbor silence bottle rope grey harbor dawn fog harbor grey harbor cold ledger dawn harbor grey salt harbor salt ledger cold grey dawn cold silence bottle salt storm storm silence grey cold rope cold rope dawn rope harbor silence wharf cold salt dawn bottle wharf bottle harbor bottle storm storm harbor harbor fog ledger fog storm storm dawn rope silence salt salt rope ledger fog ledger grey ledger rope salt dawn grey salt dawn wharf harbor grey dawn dawn wharf storm silence ledger ledger ledger salt silence silence salt silence harbor fog grey salt harbor storm grey dawn cold fog storm bottle ledger silence bottle grey wharf fog silence grey dawn fog storm silence ledger bottle cold harbor storm salt salt cold harbor storm dawn rope fog bottle grey wharf salt wharf silence silence storm ledger cold grey ledger rope grey ledger fog fog storm cold storm rope salt silence cold bottle grey cold grey rope cold salt dawn silence dawn fog silence bottle silence wharf bottle ledger harbor harbor silence rope cold rope ledger dawn fog harbor cold salt ledger cold grey rope silence salt harbor silence cold cold dawn grey dawn fog salt dawn silence salt bottle harbor cold grey bottle grey wharf rope salt cold ledger silence silence ledger fog silence storm rope storm fog grey harbor cold silence silence dawn wharf dawn fog silence fog grey ledger dawn cold silence harbor ledger wharf storm dawn grey dawn cold rope wharf salt grey silence grey grey salt harbor grey dawn dawn wharf grey salt harbor wharf ledger harbor storm bottle harbor rope wharf bottle storm wharf bottle dawn fog cold grey grey harbor fog bottle dawn salt bottle salt cold silence bottle cold cold bottle ledger silence ledger dawn bottle bottle fog storm silence silence grey salt harbor harbor cold salt bottle ledger dawn grey dawn dawn bottle cold bottle ledger ledger dawn storm ledger dawn salt rope rope cold fog ledger grey harbor silence fog rope fog wharf ledger bottle rope silence grey grey ledger salt ledger dawn fog grey storm bottle grey rope harbor fog dawn storm dawn harbor silence fog storm salt bottle dawn rope harbor silence storm bottle fog bottle salt fog salt dawn rope harbor fog rope wharf salt harbor salt salt silence cold fog cold salt cold wharf ledger salt ledger ledger bottle grey fog rope cold wharf salt storm dawn salt dawn salt dawn ledger salt dawn storm storm bottle dawn harbor bottle fog storm cold rope storm harbor rope bottle dawn rope rope bottle silence rope ledger storm storm fog silence silence salt ledger fog storm silence silence harbor dawn silence grey ledger salt storm bottle wharf salt wharf storm storm bottle bottle fog bottle salt dawn dawn grey storm harbor cold wharf harbor harbor ledger bottle Marta Voss (aliases watched the tide turn. Ivo Krane (aliases watched the tide turn. Edda Grimm (aliases watched the tide turn. Old Harbor watched the tide turn. Rope Street watched the tide turn. The Ledger watched the tide turn. Marta Voss (aliases watched the tide turn. Ivo Krane (aliases watched the tide turn. Edda Grimm (aliases watched the tide turn. Old Harbor watched the tide turn. Rope Street watched the tide turn. The Ledger watched the tide turn.",
+  "target": 600,
+  "written_words": 630,
+  "attempts": 1,
+  "tool_counts": {
+    "write": 1,
+    "update": 1
+  },
+  "update_info": {
+    "characters_upserted": [
+      {
+        "name": "Marta Voss (aliases",
+        "id": 1,
+        "updated": false
+      },
+      {
+        "name": "Ivo Krane (aliases",
+        "id": 2,
+        "updated": false
+      },
+      {
+        "name": "Edda Grimm (aliases",
+        "id": 3,
+        "updated": false
+      }
+    ],
+    "past_events_added": 1,
+    "requirements_added": [
+      {
+        "key": "req_ch0"
+      }
+    ],
+    "requirements_resolved": [],
+    "rejected": []
+  },
+  "update_errors": [],
+  "total_turns": 3,
+  "usage": {
+    "prompt_tokens": 10500,
+    "completion_tokens": 2805,
+    "cost": 0.0
+  },
+  "status": "accepted",
+  "accepted_at": "2026-10-16T10:32:07Z"
+}

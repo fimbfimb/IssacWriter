@@ -71,6 +71,7 @@ export type Book = {
   words_written?: number;
   chapters_written?: number;
   runner?: RunnerStatus;
+  translation?: TranslationStatus;
   author_notes?: string;
   last_error?: string;
 };
@@ -92,6 +93,28 @@ export type RunnerStatus = {
   error: string | null;
   current_chapter: number | null;
   task_alive?: boolean;
+};
+
+export type TranslationToolStatus = {
+  tool_dir: string;
+  tool_present: boolean;
+  venv_python: string | null;
+  ready: boolean;
+};
+
+export type TranslationStatus = {
+  status: string;
+  error: string | null;
+  output_file: string | null;
+  language: string | null;
+  profile_name: string | null;
+  model: string | null;
+  batch_size: number;
+  started_at: number | null;
+  finished_at: number | null;
+  interrupted: boolean;
+  task_alive?: boolean;
+  tool: TranslationToolStatus;
 };
 
 export type ChapterRecord = {

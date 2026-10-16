@@ -30,6 +30,13 @@ as the core engine, wrapped in a local GUI for planning, monitoring, interventio
   token/cost development, tool-usage totals, and a SVG concept graph (premise → acts → chapters with
   involved characters).
 - **Export**: manuscript as Markdown or TXT (chapter titles + prose), statistics as CSV.
+- **Translate** (one dashboard, shared LLM profiles): turn the written manuscript into a bilingual
+  side-by-side edition (EN↔DE and any target language) with the external tool
+  [bilingual_book_maker](https://github.com/yihong0618/bilingual_book_maker) (**MIT** by yihong0618).
+  It runs as an independent process in its own venv — a running chapter-writing job is never
+  interrupted, and the same LLM profiles defined in *LLM Profiles* are used. Outputs (bilingual
+  TXT/MD, test previews, partial outputs) live under `data/<book-id>/translations/` and can be
+  viewed/downloaded in the Translate tab. License notice: see `THIRD_PARTY_NOTICES.md`.
 
 ## Run (Windows)
 
@@ -77,6 +84,20 @@ python -m pytest backend/tests/test_core.py backend/tests/test_runner.py -q
 An OpenAI-compatible **mock LLM server** (`backend/tests/mock_llm_server.py`) and a full
 end-to-end driver (`backend/tests/e2e_run.py`) are included: they validate outline generation,
 writing, review gates, statistics and export without any real model.
+
+## Translation setup (optional, one command each)
+
+The Translate tab needs the external tool locally (kept out of this repo, not vendored):
+
+```
+git clone --depth 1 https://github.com/yihong0618/bilingual_book_maker.git tools/bilingual_book_maker
+python -m venv tools/bbm-venv
+tools\bbm-venv\Scripts\pip install -e tools/bilingual_book_maker
+```
+
+Uses the same LLM profiles as book writing (OpenAI-compatible endpoints). Test mode translates only
+the first N lines; interrupted runs can be resumed. `bilingual_book_maker` is MIT-licensed by
+yihong0618 — full notice in `THIRD_PARTY_NOTICES.md`.
 
 ## Notes
 

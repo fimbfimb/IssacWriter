@@ -91,6 +91,34 @@ export const api = {
   getStats: (id: string) => request<Stats>(`/api/books/${id}/stats`),
   exportContent: (id: string, format: "md" | "txt") =>
     request<{ content: string }>(`/api/books/${id}/export?format=${format}`),
+
+  translateStart: (
+    id: string,
+    data: {
+      target_language: string;
+      profile_id?: string;
+      single_translate?: boolean;
+      test_num?: number;
+      batch_size?: number;
+      resume?: boolean;
+    },
+  ) =>
+    request<{ status: any }>(`/api/books/${id}/translate`, {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+  translateStatus: (id: string) =>
+    request<{ status: Record<string, any> }>(`/api/books/${id}/translate/status`),
+  translateStop: (id: string) =>
+    request<{ status: any }>(`/api/books/${id}/translate/stop`, { method: "POST" }),
+  translateOutputs: (id: string) =>
+    request<{ outputs: { path: string; size: number; modified: number }[] }>(
+      `/api/books/${id}/translate/outputs`,
+    ),
+  translateFile: (id: string, path: string) =>
+    request<{ path: string; content: string }>(
+      `/api/books/${id}/translate/file?path=${encodeURIComponent(path)}`,
+    ),
 };
 
 export function openEventStream(bookId: string, onEvent: (event: any) => void): () => void {

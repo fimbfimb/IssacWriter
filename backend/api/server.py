@@ -19,6 +19,7 @@ from ..nstagent.runner import RunnerRegistry
 from ..stats.mentions import build_stats, export_markdown, export_txt
 from ..store.codex import merge_extracted
 from ..store.project import BookStore
+from ..translation.runner import TranslationRegistry
 
 ROOT = Path(__file__).resolve().parents[2]
 DATA_ROOT = Path(os.environ.get("STORYFORGE_DATA") or ROOT / "data")
@@ -94,11 +95,21 @@ class StatePatch(BaseModel):
     delete: bool = False
 
 
+class TranslateIn(BaseModel):
+    target_language: str = "German"
+    profile_id: Optional[str] = None
+    single_translate: bool = False
+    test_num: int = 0
+    batch_size: int = 10
+    resume: bool = False
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="IsaacWriter", version="0.1.0")
     store = BookStore(DATA_ROOT)
     profiles = ProfileStore(DATA_ROOT / "profiles.json")
     runners = RunnerRegistry(store)
+    translations = TranslationRegistry(store)
 
     def get_book_or_404(book_id: str) -> Dict[str, Any]:
         try:
@@ -191,6 +202,7 @@ def create_app() -> FastAPI:
         book["words_written"] = words
         book["chapters_written"] = chapters
         book["runner"] = runners.status(book_id)
+        book["translation"] = translations.get(book_id)._meta()
         book["author_notes"] = store.peek_author_notes(book_id)
         return {"book": book}
 
@@ -509,10 +521,73 @@ def create_app() -> FastAPI:
         store.set_author_notes(book_id, payload.get("notes", ""))
         return {"author_notes": store.peek_author_notes(book_id)}
 
+    @app.post("/api/books/{book_id}/translate")
+    async def translate_start(book_id: str, payload: TranslateIn):
+        book = get_book_or_404(book_id)
+        profile = profile_or_404(payload.profile_id or book.get("writer_profile_id"))
+        if profile is None:
+            raise HTTPException(400, "profile_id required (no default profile connected yet)")
+        await translations.get(book_id).start(
+            {
+                "profile": dict(profile),
+                "target_language": payload.target_language,
+                "single_translate": payload.single_translate,
+                "test_num": payload.test_num,
+                "batch_size": payload.batch_size,
+                "resume": payload.resume,
+            }
+        )
+        return {"status": translations.get(book_id)._meta()}
+
+    @app.get("/api/books/{book_id}/translate/status")
+    def translate_status(book_id: str):
+        get_book_or_404(book_id)
+        return {"status": translations.get(book_id)._meta()}
+
+    @app.post("/api/books/{book_id}/translate/stop")
+    async def translate_stop(book_id: str):
+        get_book_or_404(book_id)
+        runner = translations.get(book_id)
+        runner.stop()
+        return {"status": runner._meta()}
+
+    @app.get("/api/books/{book_id}/translate/outputs")
+    def translate_outputs(book_id: str):
+        get_book_or_404(book_id)
+        base = (DATA_ROOT / str(book_id) / "translations").resolve()
+        outputs = []
+        if base.exists():
+            for path in sorted(base.rglob("*")):
+                if path.is_file() and not path.name.startswith("."):
+                    stat = path.stat()
+                    outputs.append(
+                        {
+                            "path": str(path.relative_to(base)),
+                            "size": stat.st_size,
+                            "modified": stat.st_mtime,
+                        }
+                    )
+        return {"outputs": outputs}
+
+    @app.get("/api/books/{book_id}/translate/file")
+    def translate_file(book_id: str, path: str):
+        get_book_or_404(book_id)
+        base = (DATA_ROOT / str(book_id) / "translations").resolve()
+        target = (base / path).resolve()
+        if not str(target).startswith(str(base)):
+            raise HTTPException(400, "invalid path")
+        if target.suffix.lower() not in (".txt", ".md", ".json"):
+            raise HTTPException(400, "only .txt/.md/.json can be previewed")
+        if not target.is_file():
+            raise HTTPException(404, f"no such output: {path}")
+        content = target.read_text(encoding="utf-8", errors="replace")
+        return {"path": path, "content": content[:400_000]}
+
     @app.get("/api/books/{book_id}/events")
     async def events(book_id: str):
         get_book_or_404(book_id)
         runner = runners.get(book_id)
+        translations.get(book_id).bind_emit(runner._emit)
         queue = await runner.subscribe()
 
         async def generator():

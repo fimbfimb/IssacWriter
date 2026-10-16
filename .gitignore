@@ -20,6 +20,9 @@ PLAN.md
 node_modules/
 frontend/dist/
 
+# External tool (bilingual_book_maker clone — installed locally, not vendored in the repo)
+tools/
+
 # App runtime data (books, chapters, state, checkpoints)
 data/
 

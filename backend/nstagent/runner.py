@@ -29,6 +29,41 @@ def _now() -> float:
     return time.time()
 
 
+class DeltaRelay:
+    def __init__(self, emit, max_chars: int = 220, max_interval: float = 0.3):
+        self.emit = emit
+        self.max_chars = max_chars
+        self.max_interval = max_interval
+        self._buffer: Dict[str, str] = {}
+        self._last_flush = 0.0
+        self._chars_since_start = 0
+
+    async def feed(self, kind: str, text: str) -> None:
+        if not text:
+            return
+        self._buffer[kind] = self._buffer.get(kind, "") + text
+        self._chars_since_start += len(text)
+        now = time.monotonic()
+        total_buffered = sum(len(v) for v in self._buffer.values())
+        if total_buffered >= self.max_chars or (now - self._last_flush) >= self.max_interval:
+            await self.flush()
+
+    async def flush(self) -> None:
+        if not self._buffer:
+            self._last_flush = time.monotonic()
+            return
+        chunks = dict(self._buffer)
+        self._buffer.clear()
+        self._last_flush = time.monotonic()
+        await self.emit(
+            {
+                "type": "llm_delta",
+                "chunks": chunks,
+                "chars_total": self._chars_since_start,
+            }
+        )
+
+
 class BookRunner:
     def __init__(self, book_id: str, store: BookStore):
         self.book_id = book_id
@@ -177,18 +212,33 @@ class BookRunner:
             raise RuntimeError("planner_profile required")
         lang = book.get("language", "en")
         llm = LlmClient(planner_profile)
+        relay = DeltaRelay(self._emit)
+        await self._emit({"type": "llm_stream", "phase": "start", "label": "Planner"})
+
+        async def save_stage(stage: str, outline: Dict[str, Any]) -> None:
+            await relay.flush()
+            current = self.store.load_book(self.book_id)
+            current["outline"] = outline
+            self.store.save_book(current)
+
         builder = OutlineBuilder(
             llm,
             emit=self._emit,
             temperature=book.get("run_settings", {}).get("temperature", 0.7),
+            delta_sink=relay.feed,
+            on_stage_done=save_stage,
         )
-        outline = await builder.run(
-            story_prompt=self._story_contract(book),
-            target_words=int(book["target_words"]),
-            lang=lang,
-            codex=book.get("codex") or {},
-            existing=book.get("outline") or None,
-        )
+        try:
+            outline = await builder.run(
+                story_prompt=self._story_contract(book),
+                target_words=int(book["target_words"]),
+                lang=lang,
+                codex=book.get("codex") or {},
+                existing=book.get("outline") or None,
+            )
+        finally:
+            await relay.flush()
+            await self._emit({"type": "llm_stream", "phase": "end", "label": "Planner"})
         book = self.store.load_book(self.book_id)
         book["outline"] = outline
         self.store.save_book(book)
@@ -240,6 +290,7 @@ class BookRunner:
         )
         max_attempts = int(run_settings.get("max_attempts_per_chapter", 2))
         mode = run_settings.get("mode", "auto")
+        relay = DeltaRelay(self._emit)
         try:
             idx = 0
             while idx < len(chapters_plan):
@@ -268,6 +319,13 @@ class BookRunner:
                 author_notes = self.store.pop_author_notes(self.book_id)
                 result = None
                 for attempt in range(1, max_attempts + 1):
+                    await self._emit(
+                        {
+                            "type": "llm_stream",
+                            "phase": "start",
+                            "label": f"Chapter {ch_id} (attempt {attempt})",
+                        }
+                    )
                     try:
                         result = await writer.run(
                             chapter,
@@ -280,6 +338,7 @@ class BookRunner:
                             author_notes=author_notes,
                             visible_outline=None,
                             search_index=search_index,
+                            delta_sink=relay.feed,
                         )
                         break
                     except (ChapterIncomplete, LlmError) as exc:
@@ -292,6 +351,15 @@ class BookRunner:
                             }
                         )
                         continue
+                    finally:
+                        await relay.flush()
+                        await self._emit(
+                            {
+                                "type": "llm_stream",
+                                "phase": "end",
+                                "label": f"Chapter {ch_id} (attempt {attempt})",
+                            }
+                        )
                 if result is None:
                     raise RuntimeError(
                         f"chapter {ch_id} failed after {max_attempts} attempts"

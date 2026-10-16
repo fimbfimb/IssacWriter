@@ -1,95 +1,86 @@
-# IssacWriter
+# StoryForge — NstAgent Book Writing Studio
 
-An NstAgent-based book writing studio: a local application that writes **full-length books (10K–100K+ words)** with LLMs — planned, written, revised, and consistency-tracked chapter by chapter.
-
-The core writing engine is a faithful implementation of the method from the paper
-[*"Scaling Long-Form Story Generation via Narrative State Tracking"*](https://arxiv.org/abs/2609.35759) (NstAgent).
+Write full-length books (10K–100K+ words) with LLMs, using the method from the paper
+*"Scaling Long-Form Story Generation via Narrative State Tracking"* (NstAgent, arXiv 2609.35759)
+as the core engine, wrapped in a local GUI for planning, monitoring, intervention and statistics.
 
 ## What it does
 
-1. **Planner** — turns a premise into a *frozen outline*: premise → synopsis → acts → chapters,
-   each chapter with a proportional word target scaled to the requested total length.
-2. **Chapter loop** — a novelist agent writes each chapter in a tool-use loop:
-   it can `read` finished chapters, `search` the manuscript (BM25 via SQLite FTS5),
-   `write` the chapter (gated to ±20 % of its word target), `correct` exact passages, and
-   `update` a structured **narrative state**.
-3. **Narrative state tracking** — characters, past events, and future requirements are kept
-   in a `{character_states, past_events, future_requirements}` state with a single atomic
-   4-array update per chapter (`upsert_character_state`, `add_past_event`,
-   `add_future_requirement`, `resolve_future_requirement`). This is what keeps long books
-   coherent: open plot threads, character departures, and setup/payoff stay explicit.
-4. **Checkpoints** — after every chapter the book is checkpointed; runs can pause, resume,
-   or stop at any point.
+- **Frozen 4-stage planning** (paper-faithful): premise → detailed synopsis → acts → chapter-level
+  JSON outline with per-chapter word targets (10K→10 chapters, 20K→15, 50K→25, 100K→40, proportional
+  word normalization). Every stage is editable in the GUI before you freeze the outline.
+- **Chapter-by-chapter writing agent** (paper-faithful `narrative_ops` protocol): per chapter the
+  model may `read` (max 3), `search` (max 5, SQLite FTS5 + BM25 sentence windows), `write` the full
+  chapter (±20 % length gate, rejected drafts compacted out of history), `correct` (max 3) and —
+  exactly once — `update` the typed narrative state `sₜ = (characters, past events, future
+  requirements)` with a four-array atomic JSON call. Ends with `DONE`, max 50 turns/chapter,
+  checkpoint after every chapter.
+- **Freely selectable LLMs**: any OpenAI-compatible endpoint (Ollama, LM Studio, llama.cpp server,
+  OpenRouter, OpenAI, DeepSeek, …) as editable profiles with temperature, output-token limit and
+  price per 1M tokens (drives the cost statistics). Separate planner and writer model per book.
+- **Intervention**: run fully automatically or pause per chapter (review gate: approve / edit the
+  prose / demand a rewrite with instructions / attach author notes injected into the next chapter
+  prompt). Pause, stop and resume anytime — everything is checkpointed.
+- **Codex** (story bible): characters with aliases/roles/colors, settings, world lore. The codex is
+  injected into the planner prompts and powers the mention statistics; the live agent-side narrative
+  state is shown next to it.
+- **Statistics**: character presence timeline (who appears when, who leaves — from alias mention
+  scanning of every chapter, with entry/exit markers), settings timeline, plot-thread gantt (open
+  obligations from the state updates), words-per-chapter vs. target with cumulative curve,
+  token/cost development, tool-usage totals, and a SVG concept graph (premise → acts → chapters with
+  involved characters).
+- **Export**: manuscript as Markdown or TXT (chapter titles + prose), statistics as CSV.
 
-## Features
-
-- **Any OpenAI-compatible LLM** (Ollama, LM Studio, llama.cpp, OpenRouter, OpenAI, DeepSeek, …)
-  via named connection profiles; separate planner/writer model per book, with token & cost accounting.
-- **Multilingual books** — prompt templates in English & German.
-- **Review gate** — per-chapter approval mode: approve prose, edit chapters or narrative state,
-  add author notes injected into the next chapter, or rewrite.
-- **Codex** — user-authored characters, settings, and lore (with aliases) that get injected into
-  the planning prompts and can be synced with the agent's live state.
-- **Statistics** — character/setting presence timelines (mention scan + state snapshots),
-  words vs. target per chapter, per-chapter tool calls, tokens/cost, and dangling plot threads
-  (future requirements that were never resolved).
-- **Export** — full manuscript as Markdown/TXT, state JSON, stats CSV.
-- **REST API with SSE** — every run step (tool calls, writes, gates) is streamed live.
-
-## Project layout
+## Run (Windows)
 
 ```
-backend/
-├── main.py                 # uvicorn entry point
-├── api/server.py           # FastAPI routes + SSE event stream
-├── llm/                    # OpenAI-compatible client, profiles, usage & cost accounting
-├── nstagent/
-│   ├── prompts.py          # system/chapter/planner prompts (EN/DE, from paper App. A.2)
-│   ├── state.py            # narrative state (C/P/F), 4-array atomic update, snapshots
-│   ├── tools.py            # read/search/write/correct/update schemas + handlers
-│   ├── search_index.py     # SQLite FTS5 BM25 sentence-window index
-│   ├── planner.py          # premise → synopsis → acts → chapters, word normalization
-│   ├── agent.py            # chapter tool-use loop, ±20 % length gate, budgets
-│   └── runner.py           # background run controller: auto vs. review gate, pause/resume/stop
-├── store/project.py        # book persistence (JSON files + checkpoints)
-├── stats/mentions.py       # mention scan → presence timelines
-└── tests/                  # pytest: state ops, length gate, tokenization, mock-LLM run
-```
-
-## Getting started
-
-Requirements: **Python 3.10+**
-
-```bash
 pip install -r backend/requirements.txt
-python -m backend.main --port 8000
+cd frontend && npm install && npm run build && cd ..
+python -m uvicorn backend.api.server:app --host 127.0.0.1 --port 8000
 ```
 
-The API is then served at `http://127.0.0.1:8000` (health check: `GET /api/health`).
+Open http://127.0.0.1:8000.
 
-1. Create an LLM profile (`POST /api/profiles`) with your endpoint's base URL, key, and model —
-   any OpenAI-compatible server works (e.g. Ollama at `http://localhost:11434/v1`).
-2. Create a book (`POST /api/books`), generate the outline, review it, and freeze it.
-3. Start the run (`POST /api/books/{id}/run/start`) — in `auto` mode it writes straight through
-   the outline; in `review` mode it pauses after each chapter for your approval.
-4. Follow the live event stream (`GET /api/books/{id}/events`) and check stats
-   (`GET /api/books/{id}/stats`) while it writes.
+Development mode (hot reload): run the backend as above plus `npm run dev` in `frontend/`
+(Vite serves http://localhost:5173 and proxies `/api` to port 8000).
 
-### Run tests
+## First steps in the UI
 
-```bash
-python -m pytest backend/tests -q
+1. **LLM Profiles** tab: create a profile. For a local Ollama: base URL `http://localhost:11434/v1`,
+   any placeholder API key, model name (use *Test* to list installed models). For paid APIs: real
+   key + price per 1M tokens for cost stats.
+2. **New Book**: title, story prompt, language (EN/DE), target words, optional style notes.
+3. **Codex** tab: register your characters (names + aliases!), settings and lore before planning —
+   the planner will use them and the statistics rely on the aliases.
+4. **Outline** tab: pick the planner profile, generate, review/edit every stage, freeze.
+5. **Write** tab: pick the writer profile, choose *full auto* or *review each chapter*, start.
+6. **Statistics** tab: watch presence timelines, plot threads, progress and cost.
+
+## How the paper protocol maps to the app
+
+| Paper (NstAgent) | StoryForge |
+|---|---|
+| Planner stages 1–4 with frozen outline | Outline tab, `backend/nstagent/planner.py` |
+| State `sₜ=(Cₜ,Pₜ,Fₜ)` with 4-array atomic update | `backend/nstagent/state.py`, `update` tool in `agent.py` |
+| Tools read/search/write/correct with budgets | `backend/nstagent/agent.py` (read≤3, search≤5, correct≤3) |
+| ±20 % length gate, rejected-draft compaction | `write` tool handler |
+| SQLite FTS5 BM25 sentence-window search | `backend/nstagent/search_index.py` |
+| Checkpoint per chapter, auto-resume | `backend/store/project.py` + runner |
+| Extensions | Codex injection, author notes, review gate, mention statistics, GUI |
+
+## Tests
+
+```
+python -m pytest backend/tests/test_core.py backend/tests/test_runner.py -q
 ```
 
-Tests use a built-in mock LLM server, so they run fully offline.
+An OpenAI-compatible **mock LLM server** (`backend/tests/mock_llm_server.py`) and a full
+end-to-end driver (`backend/tests/e2e_run.py`) are included: they validate outline generation,
+writing, review gates, statistics and export without any real model.
 
-## Status
+## Notes
 
-- ✅ **Backend** — NstAgent core (planner, chapter loop, narrative state, FTS index),
-  run controller (auto/review, pause/resume/stop), REST API + SSE, persistence, stats, export.
-- 🔜 **Web GUI** — book library, outline editor, live write view, codex, statistics dashboard
-  (planned: Vite + React + TypeScript frontend served by the backend).
-
-## License
-
-[MIT](LICENSE)
+- Cost figures are estimates from the configured per-1M-token prices, summed from API usage fields.
+- The narrative-state entries can also be hand-edited in the GUI (pause the run first).
+- Everything is stored under `data/<book-id>/` as plain JSON files (chapters, state snapshots,
+  metrics) — easy to back up, easy to diff.

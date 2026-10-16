@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
 import type { Book, OutlineChapter } from "../types";
+import LiveStreamBox from "./LiveStreamBox";
 
 export default function OutlineTab({
   book,
@@ -16,6 +17,7 @@ export default function OutlineTab({
   const outline = book.outline;
   const frozen = outline?.frozen ?? false;
   const busy = ["generating_outline", "writing", "waiting_review"].includes(book.runner?.status ?? "");
+  const hasStream = events.some((e) => e.type === "llm_delta");
 
   const [plannerProfileId, setPlannerProfileId] = useState<string>(book.planner_profile_id ?? "");
   const [profiles, setProfiles] = useState<{ id: string; name: string; model: string }[]>([]);
@@ -159,6 +161,11 @@ export default function OutlineTab({
           )}
         </div>
         {stageInfo() && <div className="inline-note">{stageInfo()}</div>}
+        {(book.runner?.status === "generating_outline" || hasStream) && (
+          <div style={{ marginTop: 10 }}>
+            <LiveStreamBox events={events} active={book.runner?.status === "generating_outline"} height={200} />
+          </div>
+        )}
         {book.runner?.status === "generating_outline" && (
           <div className="inline-note">Outline generation is running — live progress in the Write tab's event feed or SSE console.</div>
         )}

@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+import httpx
 from openai import AsyncOpenAI
 
 
@@ -27,6 +28,7 @@ class Usage:
     completion_tokens: int = 0
     price_in_per_m: float = 0.0
     price_out_per_m: float = 0.0
+    estimated: bool = False
 
     @property
     def cost(self) -> float:
@@ -40,6 +42,7 @@ class Usage:
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "cost": round(self.cost, 6),
+            "estimated": self.estimated,
         }
 
 
@@ -86,7 +89,7 @@ class LlmClient:
             base_url=profile.base_url or None,
             api_key=profile.api_key or "sk-no-key-required",
             max_retries=0,
-            timeout=600.0,
+            timeout=httpx.Timeout(900.0, read=900.0, write=600.0, connect=30.0),
         )
 
     async def chat(
@@ -96,7 +99,12 @@ class LlmClient:
         tool_choice: Optional[str] = None,
         temperature: Optional[float] = None,
         max_output_tokens: Optional[int] = None,
+        on_delta: Optional[Any] = None,
     ) -> LlmResponse:
+        if on_delta is not None:
+            return await self._chat_stream(
+                messages, tools, tool_choice, temperature, max_output_tokens, on_delta
+            )
         kwargs: Dict[str, Any] = {
             "model": self.profile.model,
             "messages": messages,
@@ -147,6 +155,127 @@ class LlmClient:
         except Exception as exc:
             raise LlmError(str(exc)) from exc
         return sorted(model.id for model in page.data)
+
+    async def _chat_stream(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        tool_choice: Optional[str],
+        temperature: Optional[float],
+        max_output_tokens: Optional[int],
+        on_delta: Any,
+    ) -> LlmResponse:
+        kwargs: Dict[str, Any] = {
+            "model": self.profile.model,
+            "messages": messages,
+            "temperature": self.profile.temperature if temperature is None else temperature,
+            "max_tokens": max_output_tokens or self.profile.max_output_tokens,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        if tools:
+            kwargs["tools"] = tools
+            if tool_choice:
+                kwargs["tool_choice"] = tool_choice
+
+        stream = None
+        try:
+            try:
+                stream = await self._client.chat.completions.create(**kwargs)
+            except Exception as first_error:
+                if "stream_options" in str(first_error):
+                    kwargs.pop("stream_options", None)
+                    stream = await self._client.chat.completions.create(**kwargs)
+                else:
+                    raise
+        except Exception as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            raise LlmError(str(exc), status_code=status) from exc
+
+        content_parts: List[str] = []
+        reasoning_parts: List[str] = []
+        calls: Dict[int, Dict[str, Any]] = {}
+        usage_payload: Dict[str, Any] | None = None
+        finish_reason = "stop"
+        try:
+            async for chunk in stream:
+                if getattr(chunk, "usage", None):
+                    usage_payload = {
+                        "prompt_tokens": chunk.usage.prompt_tokens or 0,
+                        "completion_tokens": chunk.usage.completion_tokens or 0,
+                    }
+                if not chunk.choices:
+                    continue
+                choice = chunk.choices[0]
+                delta = choice.delta
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
+                dump = delta.model_dump() if hasattr(delta, "model_dump") else {}
+                reasoning = (
+                    dump.get("reasoning_content")
+                    or dump.get("reasoning")
+                    or dump.get("thinking")
+                    or ""
+                )
+                if reasoning:
+                    reasoning_parts.append(reasoning)
+                    await on_delta("reasoning", reasoning)
+                if delta.content:
+                    content_parts.append(delta.content)
+                    await on_delta("content", delta.content)
+                for tc in delta.tool_calls or []:
+                    index = getattr(tc, "index", 0) or 0
+                    entry = calls.setdefault(index, {"id": tc.id or "", "name": None, "args": []})
+                    if tc.id:
+                        entry["id"] = tc.id
+                    function = getattr(tc, "function", None)
+                    if function is not None and function.name and entry["name"] is None:
+                        entry["name"] = function.name
+                    if function is not None and function.arguments:
+                        entry["args"].append(function.arguments)
+                        await on_delta("tool_args", function.arguments)
+        finally:
+            close = getattr(stream, "close", None)
+            if close is not None:
+                result = close()
+                if hasattr(result, "__await__"):
+                    await result
+
+        content = "".join(content_parts).strip()
+        if not content:
+            content = "".join(reasoning_parts).strip()
+        tool_calls: List[ToolCall] = []
+        for index in sorted(calls):
+            entry = calls[index]
+            tool_calls.append(
+                ToolCall(
+                    call_id=entry["id"] or f"call-{index}",
+                    name=entry["name"] or "unknown",
+                    arguments="".join(entry["args"]) or "{}",
+                )
+            )
+        usage = Usage()
+        if usage_payload is not None:
+            usage.prompt_tokens = int(usage_payload["prompt_tokens"])
+            usage.completion_tokens = int(usage_payload["completion_tokens"])
+        else:
+            import math as _math
+
+            prompt_chars = sum(len(str(m.get("content") or "")) for m in messages)
+            completion_chars = len(content) + sum(
+                len(c.arguments) + len(c.name) for c in tool_calls
+            )
+            usage.prompt_tokens = _math.ceil(prompt_chars / 4)
+            usage.completion_tokens = _math.ceil(completion_chars / 4)
+            usage.estimated = True
+        usage.price_in_per_m = self.profile.price_in_per_m
+        usage.price_out_per_m = self.profile.price_out_per_m
+        return LlmResponse(
+            content=content,
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
+            usage=usage,
+        )
 
 
 def extract_json(text: str) -> Any:

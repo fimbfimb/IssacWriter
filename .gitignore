@@ -15,3 +15,14 @@ __pycache__/
 
 # Projekt-Dokumentation
 PLAN.md
+
+# Frontend
+node_modules/
+frontend/dist/
+
+# App runtime data (books, chapters, state, checkpoints)
+data/
+
+# Env
+.env
+*.local.json

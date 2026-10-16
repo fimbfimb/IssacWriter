@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api";
 import type { Book, ChapterRecord, Profile } from "../types";
+import LiveStreamBox from "./LiveStreamBox";
 
 function formatEvent(event: any): { time: string; html: string } {
   const time = event.sent_at ? new Date(event.sent_at * 1000).toLocaleTimeString() : "";
@@ -319,31 +320,26 @@ export default function WriteTab({
         </div>
 
         <div>
-          {book.runner?.status === "writing" && (
+          {(runnerStatus === "writing" ||
+            runnerStatus === "waiting_review" ||
+            runnerStatus === "generating_outline" ||
+            runnerStatus === "paused") && (
             <div className="card">
-              <strong>Live events</strong>
-              <div ref={feedRef} className="event-feed" style={{ marginTop: 8 }}>
-                {feedLines.map((line) => (
-                  <div key={line.key}>
-                    <span className="ev-time">{line.time}</span>
-                    <span dangerouslySetInnerHTML={{ __html: line.html }} />
+              <LiveStreamBox events={events} active={runnerStatus === "writing" || runnerStatus === "generating_outline"} />
+              {runnerStatus !== "generating_outline" && (
+                <>
+                  <strong style={{ display: "block", margin: "12px 0 6px" }}>Event log</strong>
+                  <div ref={feedRef} className="event-feed" style={{ height: 260 }}>
+                    {feedLines.map((line) => (
+                      <div key={line.key}>
+                        <span className="ev-time">{line.time}</span>
+                        <span dangerouslySetInnerHTML={{ __html: line.html }} />
+                      </div>
+                    ))}
+                    {feedLines.length === 0 && <span className="muted">waiting for events…</span>}
                   </div>
-                ))}
-                {feedLines.length === 0 && <span className="muted">waiting for events…</span>}
-              </div>
-            </div>
-          )}
-          {book.runner?.status === "waiting_review" && (
-            <div className="card">
-              <strong>Live events (paused at review gate)</strong>
-              <div ref={feedRef} className="event-feed" style={{ marginTop: 8 }}>
-                {feedLines.map((line) => (
-                  <div key={line.key}>
-                    <span className="ev-time">{line.time}</span>
-                    <span dangerouslySetInnerHTML={{ __html: line.html }} />
-                  </div>
-                ))}
-              </div>
+                </>
+              )}
             </div>
           )}
 

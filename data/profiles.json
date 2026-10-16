@@ -1,16 +1,16 @@
 {
-  "5641e4b1": {
-    "name": "Mock Local",
-    "base_url": "http://127.0.0.1:9393/v1",
-    "api_key": "mock-key",
-    "model": "mock-storyforge",
+  "6e6b42de": {
+    "name": "Ollama (local)",
+    "base_url": "http://localhost:11434/v1",
+    "api_key": "",
+    "model": "glm-5.3-flash:cloud",
     "temperature": 0.7,
     "max_output_tokens": 32768,
-    "price_in_per_m": 0.0,
-    "price_out_per_m": 0.0,
-    "id": "5641e4b1"
+    "price_in_per_m": 2.0,
+    "price_out_per_m": 5.0,
+    "id": "6e6b42de"
   },
-  "30018dfa": {
+  "0db6bbf0": {
     "name": "Mock Local",
     "base_url": "http://127.0.0.1:9393/v1",
     "api_key": "mock-key",
@@ -19,9 +19,9 @@
     "max_output_tokens": 32768,
     "price_in_per_m": 0.0,
     "price_out_per_m": 0.0,
-    "id": "30018dfa"
+    "id": "0db6bbf0"
   },
-  "f5b5730e": {
+  "40e0d7fd": {
     "name": "Mock Local",
     "base_url": "http://127.0.0.1:9393/v1",
     "api_key": "mock-key",
@@ -30,6 +30,17 @@
     "max_output_tokens": 32768,
     "price_in_per_m": 0.0,
     "price_out_per_m": 0.0,
-    "id": "f5b5730e"
+    "id": "40e0d7fd"
+  },
+  "00259e26": {
+    "name": "Mock Local",
+    "base_url": "http://127.0.0.1:9393/v1",
+    "api_key": "mock-key",
+    "model": "mock-storyforge",
+    "temperature": 0.7,
+    "max_output_tokens": 32768,
+    "price_in_per_m": 0.0,
+    "price_out_per_m": 0.0,
+    "id": "00259e26"
   }
 }

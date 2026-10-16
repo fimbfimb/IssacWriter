@@ -106,15 +106,27 @@ class OutlineBuilder:
         emit: Optional[EmitFn] = None,
         temperature: float = 0.7,
         max_stage_tokens: int = 16384,
+        delta_sink: Optional[Any] = None,
+        on_stage_done: Optional[EmitFn] = None,
     ):
         self.llm = llm
         self.emit = emit
         self.temperature = temperature
         self.max_stage_tokens = max_stage_tokens
+        self.delta_sink = delta_sink
+        self.on_stage_done = on_stage_done
 
     async def _emit(self, event: Dict[str, Any]) -> None:
         if self.emit is not None:
             await self.emit(event)
+
+    async def _stage_done(self, stage: str, outline: Dict[str, Any]) -> None:
+        if self.on_stage_done is not None:
+            await self.on_stage_done(stage, outline)
+
+    async def _relay(self, kind: str, text: str) -> None:
+        if self.delta_sink is not None:
+            await self.delta_sink(kind, text)
 
     async def _stage_text(
         self, lang: str, prompt: str, stage_name: str
@@ -125,7 +137,10 @@ class OutlineBuilder:
         ]
         for attempt in range(3):
             response = await self.llm.chat(
-                messages, temperature=self.temperature, max_output_tokens=self.max_stage_tokens
+                messages,
+                temperature=self.temperature,
+                max_output_tokens=self.max_stage_tokens,
+                on_delta=None if self.delta_sink is None else self._relay,
             )
             await self._emit(
                 {
@@ -165,6 +180,7 @@ class OutlineBuilder:
             )
             outline["premise"] = premise
             await self._emit({"type": "planner_stage_done", "stage": "premise", "content": premise})
+            await self._stage_done("premise", outline)
 
         context_parts: List[str] = []
         if detailed:
@@ -182,6 +198,7 @@ class OutlineBuilder:
                 await self._emit(
                     {"type": "planner_stage_done", "stage": "synopsis", "content": synopsis}
                 )
+                await self._stage_done("synopsis", outline)
             context_parts.append(outline["synopsis"])
             if not outline.get("acts"):
                 await self._emit({"type": "planner_stage_started", "stage": "acts"})
@@ -196,6 +213,7 @@ class OutlineBuilder:
                 outline["acts"] = acts
                 await self._emit({"type": "planner_stage_done", "stage": "acts", "content": acts})
                 outline["act_sections"] = _extract_act_sections(acts)
+                await self._stage_done("acts", outline)
             context_parts.append(outline["acts"])
         context_parts.append(outline["premise"])
         context = "\n\n".join(context_parts)
@@ -236,7 +254,8 @@ class OutlineBuilder:
                     )},
                 ]
                 response = await self.llm.chat(
-                    messages, temperature=self.temperature, max_output_tokens=self.max_stage_tokens
+                    messages, temperature=self.temperature, max_output_tokens=self.max_stage_tokens,
+                    on_delta=None if self.delta_sink is None else self._relay,
                 )
                 chapters_raw = response.content
         else:
@@ -252,6 +271,7 @@ class OutlineBuilder:
                 "content": outline["chapters"],
             }
         )
+        await self._stage_done("chapters", outline)
         return outline
 
 

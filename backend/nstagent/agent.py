@@ -70,6 +70,9 @@ class ChapterWriter:
         if self.emit is not None:
             await self.emit(event)
 
+    async def _relay_delta(self, kind: str, text: str, delta_sink: Any) -> None:
+        if delta_sink is not None:
+            await delta_sink(kind, text)
     def _per_call_tokens(self, target: int) -> int:
         if not self.dynamic_tokens:
             return self.hard_max_output_tokens
@@ -87,6 +90,7 @@ class ChapterWriter:
         author_notes: str = "",
         visible_outline: Optional[str] = None,
         search_index: Optional[ChapterSearchIndex] = None,
+        delta_sink: Optional[Any] = None,
     ) -> ChapterResult:
         ch_id = int(chapter["id"])
         target = int(chapter["word_count"])
@@ -124,6 +128,11 @@ class ChapterWriter:
             {"role": "user", "content": user_prompt},
         ]
         per_call_max_tokens = self._per_call_tokens(target)
+        relay = (
+            (lambda kind, text: self._relay_delta(kind, text, delta_sink))
+            if delta_sink is not None
+            else None
+        )
 
         total_turns = 0
         while total_turns < self.max_turns:
@@ -132,6 +141,7 @@ class ChapterWriter:
                 messages, tools=TOOLS,
                 temperature=self.temperature,
                 max_output_tokens=per_call_max_tokens,
+                on_delta=relay,
             )
             usage.prompt_tokens += response.usage.prompt_tokens
             usage.completion_tokens += response.usage.completion_tokens

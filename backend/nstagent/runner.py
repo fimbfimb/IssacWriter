@@ -133,6 +133,9 @@ class BookRunner:
             book["status"] = status if status != STATUS_STOPPING else STATUS_PAUSED
             if error:
                 book["last_error"] = error
+            else:
+                # a clean status change clears a stale error banner
+                book.pop("last_error", None)
             self.store.save_book(book)
         except Exception:
             pass

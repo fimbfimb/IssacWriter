@@ -97,7 +97,12 @@ class StatePatch(BaseModel):
 
 class TranslateIn(BaseModel):
     target_language: str = "German"
+    mode: str = "tool"
     profile_id: Optional[str] = None
+    candidate_profile_ids: List[str] = Field(default_factory=list)
+    judge_profile_id: Optional[str] = None
+    unload_after_call: bool = True
+    chapter_ids: Optional[List[int]] = None
     single_translate: bool = False
     test_num: int = 0
     batch_size: int = 10
@@ -524,19 +529,39 @@ def create_app() -> FastAPI:
     @app.post("/api/books/{book_id}/translate")
     async def translate_start(book_id: str, payload: TranslateIn):
         book = get_book_or_404(book_id)
-        profile = profile_or_404(payload.profile_id or book.get("writer_profile_id"))
-        if profile is None:
-            raise HTTPException(400, "profile_id required (no default profile connected yet)")
-        await translations.get(book_id).start(
-            {
-                "profile": dict(profile),
-                "target_language": payload.target_language,
-                "single_translate": payload.single_translate,
-                "test_num": payload.test_num,
-                "batch_size": payload.batch_size,
-                "resume": payload.resume,
-            }
-        )
+        mode = (payload.mode or "tool").strip().lower()
+        config: Dict[str, Any] = {
+            "target_language": payload.target_language,
+            "mode": mode,
+            "chapter_ids": payload.chapter_ids,
+            "single_translate": payload.single_translate,
+            "test_num": payload.test_num,
+            "batch_size": payload.batch_size,
+            "resume": payload.resume,
+        }
+        if mode == "tool":
+            profile = profile_or_404(payload.profile_id or book.get("writer_profile_id"))
+            if profile is None:
+                raise HTTPException(400, "profile_id required (no default profile connected yet)")
+            config["profile"] = dict(profile)
+        elif mode == "ensemble":
+            candidates = []
+            seen: List[str] = []
+            for raw_id in payload.candidate_profile_ids:
+                if not raw_id or raw_id in seen:
+                    continue
+                seen.append(raw_id)
+                candidates.append(dict(profile_or_404(raw_id)))
+            if not candidates:
+                raise HTTPException(400, "ensemble mode needs at least one candidate profile")
+            if len(candidates) > 6:
+                raise HTTPException(400, "maximum 6 candidate profiles")
+            config["candidates"] = candidates
+            config["judge"] = dict(profile_or_404(payload.judge_profile_id)) if payload.judge_profile_id else None
+            config["unload_after_call"] = payload.unload_after_call
+        else:
+            raise HTTPException(400, "mode must be 'tool' or 'ensemble'")
+        await translations.get(book_id).start(config)
         return {"status": translations.get(book_id)._meta()}
 
     @app.get("/api/books/{book_id}/translate/status")

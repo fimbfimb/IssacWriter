@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from ..store.project import BookStore
+from .ensemble import TranslationStopped, run_ensemble_translation
 from .exporter import build_translation_source
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -77,9 +78,11 @@ class TranslationRunner:
         self.profile_name: Optional[str] = None
         self.model: Optional[str] = None
         self.batch_size: int = 10
+        self.mode: str = "tool"
         self.started_at: Optional[float] = None
         self.finished_at: Optional[float] = None
         self.interrupted = False
+        self._stop_requested = False
         self.console: deque = deque(maxlen=150)
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._task: Optional[asyncio.Task] = None
@@ -129,60 +132,89 @@ class TranslationRunner:
     async def start(self, config: Dict[str, Any]) -> None:
         if self._task is not None and not self._task.done():
             raise RuntimeError("translation already in progress")
-        if not config.get("profile"):
+        mode = str(config.get("mode") or "tool").strip().lower() or "tool"
+        if mode not in ("tool", "ensemble"):
+            raise RuntimeError("mode must be 'tool' or 'ensemble'")
+        candidates = list(config.get("candidates") or [])
+        profile = dict(config["profile"]) if config.get("profile") else None
+        if mode == "tool" and not profile:
             raise RuntimeError("translation LLM profile required")
-        profile = dict(config["profile"])
-        if not profile.get("model"):
+        if mode == "tool" and profile and not profile.get("model"):
             raise RuntimeError("selected LLM profile has no model configured")
+        if mode == "ensemble" and not candidates:
+            raise RuntimeError("ensemble mode needs at least one candidate profile")
+        if mode == "ensemble" and any(not c.get("model") for c in candidates):
+            raise RuntimeError("a candidate profile has no model configured")
+        self.mode = mode
 
-        status = tool_status()
-        if not status["tool_present"]:
-            raise RuntimeError(
-                f"bilingual_book_maker not found in {BBM_ROOT}; clone it per README (Translation setup)"
-            )
-        if status["venv_python"] is None:
-            raise RuntimeError("tool venv missing — run the setup commands from the README")
+        if mode == "tool":
+            status = tool_status()
+            if not status["tool_present"]:
+                raise RuntimeError(
+                    f"bilingual_book_maker not found in {BBM_ROOT}; clone it per README (Translation setup)"
+                )
+            if status["venv_python"] is None:
+                raise RuntimeError("tool venv missing — run the setup commands from the README")
 
         self.status = STATUS_IDLE
         self.error = None
         self.output_file = None
         self.interrupted = False
         self.language = str(config.get("target_language") or "German").strip() or "German"
-        self.profile_name = profile.get("name")
-        self.model = profile.get("model")
         try:
             self.batch_size = max(1, min(200, int(config.get("batch_size") or 10)))
         except Exception:
             self.batch_size = 10
+        if mode == "tool":
+            self.profile_name = (profile or {}).get("name")
+            self.model = (profile or {}).get("model")
+        else:
+            self.profile_name = "ensemble (" + " · ".join(
+                str(c.get("name") or c.get("model")) for c in candidates
+            ) + ")"
+            self.model = ", ".join(str(c.get("model")) for c in candidates[:4])
 
         outdir = self.store.root / self.book_id / "translations" / _slugify(self.language)
         outdir.mkdir(parents=True, exist_ok=True)
         self.outdir = outdir
         source = outdir / "book.txt"
         resume = bool(config.get("resume"))
-        if resume and not (outdir / ".book.temp.bin").exists():
+        if resume and mode == "tool" and not (outdir / ".book.temp.bin").exists():
             raise RuntimeError("no resumable run for this language — start fresh instead")
-        if not resume:
+        try:
+            chapters = self.store.written_chapters(self.book_id)
+        except Exception:
+            chapters = []
+        chapter_ids = config.get("chapter_ids")
+        if chapter_ids not in (None, ""):
             try:
-                build_translation_source(self.store.written_chapters(self.book_id), source)
+                wanted = {int(ch) for ch in chapter_ids}
             except Exception:
-                raise RuntimeError("no written chapters yet — write a chapter first")
+                raise RuntimeError("chapter_ids must be a list of chapter numbers")
+            chapters = [c for c in chapters if int(c["id"]) in wanted]
+        if not chapters:
+            raise RuntimeError("no written chapters yet — write a chapter first")
+        if mode == "tool" and not resume:
+            build_translation_source(chapters, source)
 
         self.started_at = time.time()
         self.finished_at = None
         self.status = STATUS_RUNNING
+        self._stop_requested = False
         self._save_meta()
         self._task = asyncio.create_task(
-            self._run_job(config, profile, source, resume), name=f"translate-{self.book_id}"
+            self._run_job(mode, config, profile or {}, source, resume, chapters),
+            name=f"translate-{self.book_id}",
         )
 
     def stop(self) -> None:
+        self._stop_requested = True
         proc = self._proc
+        if self._task is not None and not self._task.done():
+            self.status = STATUS_STOPPING
+            self._save_meta()
         if proc is None or proc.returncode is not None:
-            if self._task is not None and not self._task.done():
-                self.status = STATUS_STOPPING
             return
-        self.status = STATUS_STOPPING
         if sys.platform == "win32":
             # Deliver Ctrl+C so the tool saves its resume state file gracefully.
             try:
@@ -197,11 +229,32 @@ class TranslationRunner:
 
     async def _run_job(
         self,
+        mode: str,
         config: Dict[str, Any],
         profile: Dict[str, Any],
         source: Path,
         resume: bool,
+        chapters: List[Dict[str, Any]],
     ) -> None:
+        test_num = int(config.get("test_num") or 0)
+        judge = dict(config.get("judge") or {})
+        await self._fire(
+            {
+                "type": "translation_started",
+                "mode": mode,
+                "language": self.language,
+                "model": self.model,
+                "profile_name": self.profile_name,
+                "candidates": [c.get("name") or c.get("model") for c in (config.get("candidates") or [])],
+                "judge": judge.get("name") or judge.get("model"),
+                "test_num": test_num,
+                "single_translate": bool(config.get("single_translate")),
+                "batch_size": self.batch_size,
+            }
+        )
+        if mode == "ensemble":
+            await self._job_ensemble(config, judge, chapters, resume)
+            return
         try:
             cmd: List[str] = [
                 str(tool_python()),
@@ -239,17 +292,6 @@ class TranslationRunner:
             env["OPENAI_API_KEY"] = profile.get("api_key") or "local"
             env.pop("OPENAI_BASE_URL", None)
 
-            await self._fire(
-                {
-                    "type": "translation_started",
-                    "language": self.language,
-                    "model": self.model,
-                    "profile_name": self.profile_name,
-                    "test_num": test_num,
-                    "single_translate": bool(config.get("single_translate")),
-                    "batch_size": self.batch_size,
-                }
-            )
             create_flags = {}
             if sys.platform == "win32":
                 create_flags["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -282,6 +324,77 @@ class TranslationRunner:
 
         self.finished_at = time.time()
         await self._finalize(return_code)
+        self._save_meta()
+
+    async def _job_ensemble(
+        self,
+        config: Dict[str, Any],
+        judge: Dict[str, Any],
+        chapters: List[Dict[str, Any]],
+        resume: bool,
+    ) -> None:
+        try:
+            summary = await run_ensemble_translation(
+                chapters=chapters,
+                language=self.language,
+                candidate_profiles=list(config.get("candidates") or []),
+                judge_profile=judge or None,
+                unload_after_call=bool(config.get("unload_after_call", True)),
+                batch_size=self.batch_size,
+                outdir=self.outdir or (self.store.root / self.book_id / "translations"),
+                book=self.store.load_book(self.book_id),
+                resume=resume,
+                emit=self._fire,
+                should_stop=lambda: self._stop_requested,
+            )
+        except TranslationStopped:
+            self.finished_at = time.time()
+            self.status = STATUS_STOPPED
+            self.interrupted = True
+            self.error = None
+            for candidate in (
+                self.outdir / "book_bilingual.txt",
+                self.outdir / "book_bilingual_temp.txt",
+            ):
+                if candidate.is_file():
+                    self.output_file = str(candidate)
+                    break
+            await self._fire(
+                {
+                    "type": "translation_done",
+                    "status": "interrupted",
+                    "output_file": self.output_file,
+                    "note": "Stopped by user — finished blocks kept in the report, resume continues.",
+                }
+            )
+            self._save_meta()
+            return
+        except Exception as exc:
+            self.finished_at = time.time()
+            self.status = STATUS_ERROR
+            self.error = str(exc)
+            self._save_meta()
+            await self._fire({"type": "translation_error", "error": str(exc)})
+            return
+        self.finished_at = time.time()
+        self.output_file = summary.get("output_file")
+        self.error = None
+        if summary.get("gaps") and not summary.get("batches_done"):
+            self.status = STATUS_ERROR
+            self.error = "every block failed — see the ensemble report for model errors"
+            await self._fire({"type": "translation_error", "error": self.error})
+        else:
+            self.status = STATUS_DONE
+            await self._fire(
+                {
+                    "type": "translation_done",
+                    "status": "done",
+                    "output_file": self.output_file,
+                    "gaps": summary.get("gaps") or 0,
+                    "report_file": summary.get("report_file"),
+                    "totals": summary.get("totals"),
+                }
+            )
         self._save_meta()
 
     async def _finalize(self, return_code: int) -> None:

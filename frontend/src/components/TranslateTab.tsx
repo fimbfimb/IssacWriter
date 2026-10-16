@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api";
-import type { Book, Profile, TranslationStatus } from "../types";
+import type { Book, ChapterRecord, Profile, TranslationStatus } from "../types";
+
+const JUDGE_WARNING = "Use several candidate models and a separate judge model: every block is translated by each candidate, the judge picks the winning translation. Local Ollama candidates are unloaded right after each call (keep_alive: 0) so no model clogs VRAM.";
 
 function formatTranslationEvent(event: any): { time: string; html: string } {
   const time = event.sent_at ? new Date(event.sent_at * 1000).toLocaleTimeString() : "";
@@ -8,27 +10,35 @@ function formatTranslationEvent(event: any): { time: string; html: string } {
   if (event.type === "translation_started")
     return {
       time,
-      html: `Translation started — <b>${safe(event.language)}</b> with <b>${safe(event.profile_name ?? "")}</b> (${
-        event.profile_name ? safe(event.model ?? "") : ""
-      })${event.test_num > 0 ? ` · test mode: first ${event.test_num} lines` : ""}`,
+      html: `Translation started — <b>${safe(event.language)}</b> · mode <b>${safe(event.mode ?? "tool")}</b>${
+        event.candidates?.length ? ` · candidates: ${event.candidates.map((c: string) => safe(c)).join(", ")} · judge: ${safe(event.judge ?? "—")}` : ` · <b>${safe(event.profile_name ?? "")}</b> (${safe(event.model ?? "")})`
+      }${event.test_num > 0 ? ` · test mode: first ${event.test_num} lines` : ""}`,
     };
+  if (event.type === "translation_batch") {
+    if (event.error) return { time, html: `<span class="ev-fail">✘ block ${event.batch_index}/${event.batches_total} failed: ${safe(event.error)}</span>` };
+    if (event.note) return { time, html: safe(event.note) };
+    return {
+      time,
+      html: `<span class="ev-ok">✔ block ${event.batch_index}/${event.batches_total} (chapter ${event.chapter_id ?? "?"})</span> — winner <b>${safe(event.winner ?? "")}</b>${event.reason ? `: ${safe(event.reason)}` : ""}`,
+    };
+  }
   if (event.type === "translation_output") return { time, html: safe((event.lines ?? []).slice(-2).join(" \u00b7 ")) };
-  if (event.type === "translation_done")
-    return event.status === "done"
-      ? {
-          time,
-          html: `<span class="ev-ok">✔ Translation complete</span> — saved <code>${safe(event.output_file ?? "")}</code>`,
-        }
-      : {
-          time,
-          html: `<span style="color: var(--warn)">⚠ Translation interrupted — partial output kept (resume possible)</span>`,
-        };
+  if (event.type === "translation_done") {
+    if (event.status === "done")
+      return {
+        time,
+        html: `<span class="ev-ok">✔ Translation complete</span> — saved <code>${safe(event.output_file ?? "")}</code>${
+          event.gaps ? ` <span style="color: var(--warn)">(⚠ ${event.gaps} blocks failed)</span>` : ""
+        }`,
+      };
+    return { time, html: `<span style="color: var(--warn)">⚠ Translation interrupted — partial output kept (resume possible)</span>` };
+  }
   if (event.type === "translation_error")
     return { time, html: `<span class="ev-fail">✘ Translation error: ${safe(event.error ?? "")}</span>` };
   return { time, html: safe(event.type ?? "") };
 }
 
-const TRANSLATION_EVENTS = ["translation_started", "translation_output", "translation_done", "translation_error"];
+const TRANSLATION_EVENTS = ["translation_started", "translation_batch", "translation_output", "translation_done", "translation_error"];
 
 export default function TranslateTab({
   book,
@@ -43,7 +53,13 @@ export default function TranslateTab({
 }) {
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [profileId, setProfileId] = useState(book.writer_profile_id ?? "");
+  const [mode, setMode] = useState<"tool" | "ensemble">("tool");
+  const [candidates, setCandidates] = useState<Set<string>>(new Set());
+  const [judgeId, setJudgeId] = useState("");
+  const [unloadAfterCall, setUnloadAfterCall] = useState(true);
   const [targetLanguage, setTargetLanguage] = useState("German");
+  const [chapters, setChapters] = useState<ChapterRecord[]>([]);
+  const [chapterSelection, setChapterSelection] = useState<Set<number> | null>(null);
   const [singleTranslate, setSingleTranslate] = useState(false);
   const [testMode, setTestMode] = useState(false);
   const [testNum, setTestNum] = useState(10);
@@ -62,6 +78,16 @@ export default function TranslateTab({
     api.listProfiles().then((r) => {
       setProfiles(r.profiles);
       setProfileId((prev) => prev || (book.writer_profile_id ?? "") || r.profiles[0]?.id || "");
+      setJudgeId((prev) => prev || (book.writer_profile_id ?? "") || r.profiles[0]?.id || "");
+      setCandidates((prev) => {
+        if (prev.size) return prev;
+        const first = new Set<string>();
+        const best = r.profiles[0]?.id;
+        if (best) first.add(best);
+        const second = r.profiles[1]?.id;
+        if (second) first.add(second);
+        return first;
+      });
     });
   }, []);
 
@@ -74,6 +100,7 @@ export default function TranslateTab({
   useEffect(() => {
     refreshStatus();
     refreshOutputs();
+    api.getChapters(book.id).then((r) => setChapters(r.chapters)).catch(() => {});
     const timer = window.setInterval(refreshStatus, 3000);
     return () => window.clearInterval(timer);
   }, [book.id]);
@@ -85,6 +112,10 @@ export default function TranslateTab({
   useEffect(() => {
     if (feedRef.current) feedRef.current.scrollTop = feedRef.current.scrollHeight;
   }, [events.length]);
+
+  useEffect(() => {
+    api.getChapters(book.id).then((r) => setChapters(r.chapters)).catch(() => {});
+  }, [book.id, book.chapters_written || 0]);
 
   const translationEvent = useMemo(
     () =>
@@ -111,14 +142,24 @@ export default function TranslateTab({
     }
     try {
       setResume(resumeRun);
-      await api.translateStart(book.id, {
+      const payload: any = {
         target_language: targetLanguage,
+        mode,
         profile_id: profileId,
+        chapter_ids: chapterSelection !== null ? Array.from(chapterSelection) : null,
         single_translate: singleTranslate,
         test_num: testMode ? testNum : 0,
         batch_size: batchSize,
         resume: resumeRun,
-      });
+      };
+      if (mode === "ensemble") {
+        payload.candidate_profile_ids = Array.from(candidates);
+        payload.judge_profile_id = judgeId || null;
+        payload.unload_after_call = unloadAfterCall;
+      } else {
+        payload.candidate_profile_ids = [];
+      }
+      await api.translateStart(book.id, payload);
       showToast(resumeRun ? "Resuming translation" : "Translation started");
       refreshStatus();
       refreshBook();
@@ -174,29 +215,39 @@ tools\\bbm-venv\\Scripts\\pip install -e tools/bilingual_book_maker`}
       )}
 
       <div className="card">
-        <strong>Bilingual translation (powered by bilingual_book_maker, MIT)</strong>
+        <strong>Bilingual translation (one dashboard, shared profiles)</strong>
         <div className="inline-note">
-          Translates the written chapters into a side-by-side bilingual edition. Runs as its own
-          process beside the writing run — the writer keeps its chapters and checkpoints untouched.
+          Mode 1 uses bilingual_book_maker (MIT) as an external tool. Mode 2 translates every block
+          with several models and a judge model picks the winner. Both run beside the writing run —
+          chapters and checkpoints stay untouched.
         </div>
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
-          <div className="form-col" style={{ minWidth: 250 }}>
-            <label>LLM profile (shared dashboard profiles)</label>
-            <select value={profileId} onChange={(e) => setProfileId(e.target.value)} disabled={busy}>
-              <option value="">— select —</option>
-              {profiles.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.name} ({p.model})
-                </option>
-              ))}
+          <div className="form-col" style={{ minWidth: 240 }}>
+            <label>Mode</label>
+            <select value={mode} onChange={(e) => setMode(e.target.value as any)} disabled={busy}>
+              <option value="tool">Single model (bilingual_book_maker)</option>
+              <option value="ensemble">Model ensemble + judge</option>
             </select>
           </div>
+          {mode === "tool" ? (
+            <div className="form-col" style={{ minWidth: 250 }}>
+              <label>LLM profile (shared dashboard profiles)</label>
+              <select value={profileId} onChange={(e) => setProfileId(e.target.value)} disabled={busy}>
+                <option value="">— select —</option>
+                {profiles.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name} ({p.model})
+                  </option>
+                ))}
+              </select>
+            </div>
+          ) : null}
           <div className="form-col" style={{ minWidth: 180 }}>
             <label>Target language</label>
             <input value={targetLanguage} onChange={(e) => setTargetLanguage(e.target.value)} disabled={busy} />
           </div>
           <div className="form-col" style={{ minWidth: 140 }}>
-            <label>Batch size (lines/request)</label>
+            <label>{mode === "ensemble" ? "Paragraphs per block" : "Batch size (lines/request)"}</label>
             <input
               type="number"
               min={1}
@@ -239,7 +290,7 @@ tools\\bbm-venv\\Scripts\\pip install -e tools/bilingual_book_maker`}
                 ▶ Start translation
               </button>
             )}
-            {!busy && (tState === "stopped" || tState === "error") && (
+            {!busy && ["stopped", "error"].includes(tState) && (
               <button className="btn-primary" onClick={() => start(true)}>
                 ⟳ Resume last run
               </button>
@@ -251,6 +302,58 @@ tools\\bbm-venv\\Scripts\\pip install -e tools/bilingual_book_maker`}
             )}
           </div>
         </div>
+        {mode === "ensemble" && (
+          <div style={{ marginTop: 12, borderTop: "1px solid rgba(128,140,160,0.25)", paddingTop: 12 }}>
+            <div className="inline-note" style={{ marginTop: 0 }}>{JUDGE_WARNING}</div>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
+              <div className="form-col" style={{ minWidth: 300 }}>
+                <label>Candidate profiles (translate every block)</label>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                  {profiles.map((p) => (
+                    <label key={p.id} className="chip" style={{ cursor: "pointer", color: candidates.has(p.id) ? "inherit" : "var(--muted)" }}>
+                      <input
+                        type="checkbox"
+                        checked={candidates.has(p.id)}
+                        onChange={() =>
+                          setCandidates((prev) => {
+                            const next = new Set(prev);
+                            if (next.has(p.id)) next.delete(p.id);
+                            else next.add(p.id);
+                            return next;
+                          })
+                        }
+                        disabled={busy}
+                      />{" "}
+                      {p.name} ({p.model})
+                    </label>
+                  ))}
+                </div>
+              </div>
+              <div className="form-col" style={{ minWidth: 250 }}>
+                <label>Judge model (picks the winner per block)</label>
+                <select value={judgeId} onChange={(e) => setJudgeId(e.target.value)} disabled={busy}>
+                  <option value="">— none (first candidate wins) —</option>
+                  {profiles.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name} ({p.model})
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="form-col" style={{ minWidth: 260 }}>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={unloadAfterCall}
+                    onChange={(e) => setUnloadAfterCall(e.target.checked)}
+                    disabled={busy}
+                  />{" "}
+                  Unload Ollama models after every call (keep_alive 0 — VRAM free)
+                </label>
+              </div>
+            </div>
+          </div>
+        )}
         <div className="inline-note" style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           <span className={`chip status-${tState}`}>{tState}</span>
           {statusValues?.language && <span className="chip">{statusValues.language}</span>}
@@ -261,6 +364,43 @@ tools\\bbm-venv\\Scripts\\pip install -e tools/bilingual_book_maker`}
           )}
           {statusValues?.error && <span style={{ color: "var(--danger)", fontSize: 12.5 }}>{statusValues.error}</span>}
         </div>
+      </div>
+
+      <div className="card">
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <strong>Chapters to translate</strong>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button onClick={() => setChapterSelection(null)}>All</button>
+            <button onClick={() => setChapterSelection(new Set())}>None</button>
+          </div>
+        </div>
+        {chapters.length === 0 && <div className="muted" style={{ padding: 8 }}>Nothing written yet.</div>}
+        {chapters.map((chapter) => {
+          const checked = chapterSelection === null || chapterSelection.has(chapter.id);
+          return (
+            <div
+              key={chapter.id}
+              className="chapter-list-item"
+              onClick={() => {
+                const next = new Set(chapterSelection ?? []);
+                if (next.has(chapter.id)) next.delete(chapter.id);
+                else next.add(chapter.id);
+                setChapterSelection(next);
+              }}
+            >
+              <input type="checkbox" checked={checked} readOnly />
+              <span className="muted" style={{ width: 26, fontSize: 12 }}>
+                {String(chapter.id).padStart(2, "0")}
+              </span>
+              <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {chapter.name}
+              </span>
+              <span className="muted" style={{ fontSize: 11.5 }}>
+                {chapter.written_words?.toLocaleString()} w
+              </span>
+            </div>
+          );
+        })}
       </div>
 
       <div className="split">

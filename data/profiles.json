@@ -66,5 +66,18 @@
     "thinking": "off",
     "extra_params": {},
     "id": "d7c9c84f"
+  },
+  "83a12e2b": {
+    "name": "OllamaGemma5_31Cloud",
+    "base_url": "http://localhost:11434/v1",
+    "api_key": "",
+    "model": "gemma4:31b-cloud",
+    "temperature": 0.7,
+    "max_output_tokens": 32768,
+    "price_in_per_m": 0.0,
+    "price_out_per_m": 0.0,
+    "thinking": "default",
+    "extra_params": {},
+    "id": "83a12e2b"
   }
 }

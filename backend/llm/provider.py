@@ -323,6 +323,17 @@ class LlmClient:
             timeout=httpx.Timeout(900.0, read=900.0, write=600.0, connect=30.0)
         )
 
+    async def aclose(self) -> None:
+        """Release the pooled HTTP connections (translation ensemble loop)."""
+        try:
+            await self._http.aclose()
+        except Exception:
+            pass
+        try:
+            await self._client.close()
+        except Exception:
+            pass
+
     def _is_ollama(self) -> bool:
         base = (self.profile.base_url or "").lower()
         return "ollama" in base or ":11434" in base

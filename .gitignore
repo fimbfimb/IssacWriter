@@ -1,0 +1,17 @@
+2609.35759v1.pdf
+2609.35759v1.txt
+paper_extracted.txt
+
+# Agent config (nur Quellcode ins Repo)
+.kilo/
+
+# Tests
+backend/tests/
+.pytest_cache/
+
+# Python
+__pycache__/
+*.pyc
+
+# Projekt-Dokumentation
+PLAN.md

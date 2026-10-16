@@ -118,6 +118,105 @@ export type TranslationStatus = {
   tool: TranslationToolStatus;
 };
 
+export type ReviewDecision = {
+  action: string;
+  decided_at: string;
+  edited_text?: string;
+};
+
+export type ReviewRow = {
+  id: string;
+  batch_index: number;
+  chapter_id: number;
+  chapter_name: string;
+  type: string;
+  paragraph: number | null;
+  detail: string;
+  source_en: string;
+  text_de: string;
+  stage: string | null;
+  decision: ReviewDecision | null;
+  history_count: number;
+  editable: boolean;
+};
+
+export type ReviewResponse = {
+  mode: string | null;
+  language: string;
+  open_flags: number;
+  total_flags: number;
+  chapters: {
+    chapter_id: number;
+    chapter_name: string;
+    rows: ReviewRow[];
+  }[];
+  report_path?: string | null;
+  hint?: string;
+  decided?: ReviewDecision;
+};
+
+export type SequelProposal = {
+  summary_ending: string;
+  open_threads: string[];
+  characters: { name: string; codex_id?: string; alive: boolean | null; reason: string }[];
+  proposed_title: string;
+  story_prompt: string;
+  author_notes: string;
+  extraction_error?: string;
+};
+
+export type LayoutIllustration = {
+  id: string;
+  chapter_id: number | null;
+  paragraph_index: number | null;
+  anchor_word_offset?: number;
+  scene?: string;
+  location?: string;
+  setting?: string;
+  prompt?: string;
+  image_path?: string;
+  anchor_valid?: boolean;
+  retired?: boolean;
+  near_duplicate?: boolean;
+  people_in_scene?: string[];
+};
+
+export type ExtractVisualResult = {
+  name: string;
+  status: "ok" | "no_text" | "error";
+  visual?: string;
+  detail?: string;
+  error?: string;
+};
+
+export type LayoutData = {
+  style_directive: string;
+  words_per_page: number;
+  images_every_n_pages: number;
+  cover_image_path: string;
+  characters: { name: string; visual: string }[];
+  illustrations: LayoutIllustration[];
+  book_stats?: {
+    total_words: number;
+    spacing_words?: number;
+    per_chapter?: {
+      chapter_id: number;
+      chapter_name: string;
+      words: number;
+      start_offset?: number;
+      paragraphs: number;
+    }[];
+  };
+};
+
+export type LayoutResponse = {
+  layout: LayoutData;
+  stats: {
+    total_words: number;
+    per_chapter: { chapter_id: number; chapter_name: string; words: number; paragraphs: number }[];
+  };
+};
+
 export type ChapterRecord = {
   id: number;
   name: string;

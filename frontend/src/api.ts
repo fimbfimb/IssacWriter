@@ -1,4 +1,17 @@
-import type { Book, BookSummary, ChapterRecord, Codex, Profile, StateCollection, Stats } from "./types";
+import type {
+  Book,
+  BookSummary,
+  ChapterRecord,
+  Codex,
+  ExtractVisualResult,
+  LayoutIllustration,
+  LayoutResponse,
+  Profile,
+  ReviewResponse,
+  SequelProposal,
+  StateCollection,
+  Stats,
+} from "./types";
 
 const BASE = "";
 
@@ -91,6 +104,110 @@ export const api = {
   getStats: (id: string) => request<Stats>(`/api/books/${id}/stats`),
   exportContent: (id: string, format: "md" | "txt") =>
     request<{ content: string }>(`/api/books/${id}/export?format=${format}`),
+
+  sequelPrepare: (id: string, data: { idea: string; planner_profile_id?: string; unload_after_call?: boolean }) =>
+    request<{ proposal: SequelProposal }>(`/api/books/${id}/sequel/prepare`, {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+  sequelCreate: (
+    id: string,
+    data: {
+      proposal: SequelProposal;
+      keep_character_names: string[];
+      idea: string;
+      target_words?: number | null;
+      include_dead_as_flashbacks?: boolean;
+    },
+  ) => request<{ book: Book }>(`/api/books/${id}/sequel/create`, { method: "POST", body: JSON.stringify(data) }),
+
+  translateReview: (id: string) =>
+    request<ReviewResponse>(`/api/books/${id}/translate/review`),
+  translateReviewDecide: (
+    id: string,
+    data: {
+      batch_index: number;
+      chapter_id?: number | null;
+      type: string;
+      paragraph: number | null;
+      detail: string;
+      action: string;
+      text?: string | null;
+    },
+    ) =>
+    request<{ open_flags: number; total_flags: number; review: ReviewResponse }>(
+      `/api/books/${id}/translate/review/decide`,
+      { method: "POST", body: JSON.stringify(data) },
+    ),
+  translateRetranslateBatch: (id: string, batchIndex: number, unloadAfterCall = true) =>
+    request<{ open_flags: number; total_flags: number; review: ReviewResponse }>(
+      `/api/books/${id}/translate/review/retranslate`,
+      { method: "POST", body: JSON.stringify({ batch_index: batchIndex, unload_after_call: unloadAfterCall }) },
+    ),
+
+  getLayout: (id: string) => request<LayoutResponse>(`/api/books/${id}/layout`),
+  putLayout: (id: string, data: Record<string, any>) =>
+    request<{ layout: LayoutResponse["layout"] }>(`/api/books/${id}/layout`, {
+      method: "PUT",
+      body: JSON.stringify(data),
+    }),
+  extractLayoutCharacters: (id: string, data: { profile_id?: string; unload_after_call?: boolean } = {}) =>
+    request<{ characters: { name: string; visual: string }[]; results: ExtractVisualResult[] }>(
+      `/api/books/${id}/layout/extract-characters`,
+      { method: "POST", body: JSON.stringify(data) },
+    ),
+  extractLayoutCharacter: (id: string, name: string, data: { profile_id?: string; unload_after_call?: boolean } = {}) =>
+    request<{ result: ExtractVisualResult; character: { name: string; visual: string } }>(
+      `/api/books/${id}/layout/extract-characters/${encodeURIComponent(name)}`,
+      { method: "POST", body: JSON.stringify(data) },
+    ),
+  computePositions: (id: string) =>
+    request<{ layout: LayoutResponse["layout"] }>(`/api/books/${id}/layout/compute-positions`, { method: "POST" }),
+  describeIllustration: (id: string, posId: string, data: { profile_id?: string; unload_after_call?: boolean } = {}) =>
+    request<{ illustration: LayoutIllustration }>(
+      `/api/books/${id}/layout/illustrations/${posId}/describe`,
+      { method: "POST", body: JSON.stringify(data) },
+    ),
+  uploadIllustrationImage: (id: string, posId: string, file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    return fetch(`/api/books/${id}/layout/illustrations/${posId}/image`, { method: "POST", body: form }).then(
+      async (response) => {
+        if (!response.ok) {
+          let detail = response.statusText;
+          try {
+            const body = await response.json();
+            if (body?.detail) detail = body.detail;
+          } catch {}
+          throw new Error(`${response.status}: ${detail}`);
+        }
+        return (await response.json()) as { illustration: LayoutIllustration };
+      },
+    );
+  },
+  deleteIllustrationImage: (id: string, posId: string) =>
+    request<{ illustration: LayoutIllustration }>(`/api/books/${id}/layout/illustrations/${posId}/image`, {
+      method: "DELETE",
+    }),
+  layoutImageHref: (id: string, path: string, cacheBust?: string) =>
+    `/api/books/${id}/layout/image?path=${encodeURIComponent(path)}${cacheBust ? `&v=${cacheBust}` : ""}`,
+  uploadCover: (id: string, file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    return fetch(`/api/books/${id}/layout/cover`, { method: "POST", body: form }).then(async (response) => {
+      if (!response.ok) {
+        let detail = response.statusText;
+        try {
+          const body = await response.json();
+          if (body?.detail) detail = body.detail;
+        } catch {}
+        throw new Error(`${response.status}: ${detail}`);
+      }
+      return (await response.json()) as { cover_image_path: string };
+    });
+  },
+  deleteCover: (id: string) =>
+    request<{ cover_image_path: string }>(`/api/books/${id}/layout/cover`, { method: "DELETE" }),
 
   translateStart: (
     id: string,

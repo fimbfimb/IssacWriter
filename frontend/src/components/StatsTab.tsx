@@ -274,6 +274,8 @@ function ConceptGraph({ book }: { book: Book }) {
 
 export default function StatsTab({ book, showToast }: { book: Book; showToast: (m: string) => void }) {
   const [stats, setStats] = useState<Stats | null>(null);
+  const [epubBusy, setEpubBusy] = useState(false);
+  const showError = showToast;
 
   useEffect(() => {
     api
@@ -435,7 +437,40 @@ export default function StatsTab({ book, showToast }: { book: Book; showToast: (
 
       <div className="card">
         <strong>Export</strong>
-        <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+        <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+          <button
+            onClick={async () => {
+              setEpubBusy(true);
+              try {
+                const response = await fetch(`/api/books/${book.id}/export/epub`);
+                if (!response.ok) {
+                  let detail = response.statusText;
+                  try {
+                    const body = await response.json();
+                    if (body?.detail) detail = body.detail;
+                  } catch {}
+                  throw new Error(detail);
+                }
+                const blob = await response.blob();
+                const disposition = response.headers.get("Content-Disposition") ?? "";
+                const match = /filename=([^;]+)/.exec(disposition);
+                const filename = match?.[1]?.trim() || "buch.epub";
+                const url = URL.createObjectURL(blob);
+                const anchor = document.createElement("a");
+                anchor.href = url;
+                anchor.download = filename;
+                anchor.click();
+                URL.revokeObjectURL(url);
+              } catch (err: any) {
+                showError(err.message);
+              } finally {
+                setEpubBusy(false);
+              }
+            }}
+            disabled={epubBusy}
+          >
+            {epubBusy ? "EPUB wird gebaut…" : "EPUB exportieren"}
+          </button>
           <button
             onClick={async () => {
               const result = await api.exportContent(book.id, "md");

@@ -47,7 +47,18 @@ DEFAULT_MIN_WORDS = 250
 MAX_NOTES = 12
 _MAX_REVIEW_LINES_EMITTED = 8
 
-_EMPTY_NOTE_VALUES = ("", "keine", "keine.", "none", "none.", "-", "—")
+_EMPTY_NOTE_VALUES = ("", "keine", "keine.", "none", "none.", "-", "—", "gut", "good", "ok", "okay", "done", "fine")
+
+# ANMERKUNGEN lists conscious changes ("X zu Y geändert"). Everything else below
+# the marker is model self-talk that must not reach the review GUI: instructions
+# to itself, self-checks, punctuation notes, protocol tokens.
+_META_NOTE = re.compile(
+    r"^[#>*\-\s]*(?:keep it short|no analysis|no english|one more|punctuation[ :\s:]"
+    r"|length[ :\s:]|l\u00e4nge[ :\s:]|double[-\s]?check|also consider|final answer"
+    r"|finale? fassung|scan for|repeat check|count of|note:)",
+    re.IGNORECASE,
+)
+_PROTOCOL_TAIL = re.compile(r"[\s.:!\-]*(?:TEXT|ANTWORT|ANSWER)\s*", re.IGNORECASE)
 
 _ANNOTATION_MARKER = re.compile(r"^[ \t]*[#*>-]*[ \t]*ANMERKUNGEN\b", re.IGNORECASE)
 _BULLET_PREFIX = re.compile(r"^[ \t]*(?:[-*••]|\d+[.)])[ \t]+")
@@ -147,6 +158,23 @@ _TRAILER_META = re.compile(
     r"^(?:no\s+notes?(?:\s+needed)?\.?|keine\s+anmerkungen?\.?|keine\.?|anmerkungen:\s*keine\.?)\s*[?!]*\s*$",
     re.IGNORECASE,
 )
+
+# Some models answer with a bracketed placeholder ("[paragraph]", "[translation]")
+# instead of prose — that must never enter the manuscript as real text.
+_PLACEHOLDER_TEXT = re.compile(
+    r"^\[?\s*(?:para\s*graph|text|translation|german text|deutscher text|platzhalter"
+    r"|placeholder|insert here|your (?:german )?(?:translation|text) here)\s*\]?$",
+    re.IGNORECASE,
+)
+_BRACKET_ONLY = re.compile(r"^\[[^\[\]\n]{1,40}\]$")
+
+
+def is_placeholder_prose(text: str) -> bool:
+    """A whole 'paragraph' that is just a short bracketed placeholder."""
+    stripped = (text or "").strip()
+    if not stripped or len(stripped) > 60:
+        return False
+    return bool(_PLACEHOLDER_TEXT.fullmatch(stripped) or _BRACKET_ONLY.fullmatch(stripped))
 
 
 def clean_model_prose(raw: str) -> Tuple[str, List[str], bool]:
@@ -258,6 +286,47 @@ def split_paragraphs(text: str) -> List[str]:
     return segments
 
 
+def _norm_note(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip().casefold())
+
+
+def _is_junk_note(note: str) -> bool:
+    """Protocol leftovers / self-talk that never is a conscious-change note.
+
+    The ANMERKUNGEN section is a German list per the prompt mandate: notes are
+    conscious changes the model made. English reasoning that leaks into the
+    notes section is therefore junk — a note with at least one English sentence
+    and zero German sentences is a leak. Language-neutral short notes
+    ("Bild ersetzt" has no marker tokens at all) stay.
+    """
+    value = (note or "").strip()
+    if not value:
+        return True
+    if _ANNOTATION_MARKER.match(value) or _PROTOCOL_MARKER_LINE.match(value) or _ANSWER_MARKER_LINE.match(value):
+        return True
+    if _META_NOTE.match(value):
+        return True
+    if _TRAILER_META.match(value):
+        return True
+    cleaned = _PROTOCOL_TAIL.sub(" ", value).strip(" .,;:!")
+    if cleaned.lower() in _EMPTY_NOTE_VALUES:
+        return True
+    sentences = [s for s in re.findall(r"[^.!?…]+[.!?…]*", cleaned) if s.strip()]
+    languages = [_sentence_language(s) for s in sentences]
+    english_count = sum(1 for lang in languages if lang == "english")
+    german_count = sum(1 for lang in languages if lang == "german")
+    if english_count == 0:
+        # no english reasoning signal: german or language-neutral notes pass
+        # ("Bild ersetzt" has no marker tokens and stays)
+        return False
+    if german_count == 0:
+        return True  # pure english in a german-mandated notes section: leak
+    # mixed (e.g. german result + quoted english phrase): executed changes
+    # name a german change verb; pondering/self-check leaks ("at the door …
+    # → At the door he slowed down. Good") do not
+    return not _HAS_CHANGE_VERB.search(cleaned)
+
+
 def parse_annotated_output(raw: str) -> Tuple[str, List[str], bool]:
     """Separate generated prose from a trailing ANMERKUNGEN section.
 
@@ -284,6 +353,8 @@ def parse_annotated_output(raw: str) -> Tuple[str, List[str], bool]:
             continue
         note = _BULLET_PREFIX.sub("", line.strip()).strip().rstrip(".,;")
         if note.strip().lower() in _EMPTY_NOTE_VALUES:
+            continue
+        if _is_junk_note(note):
             continue
         notes.append(note)
         if len(notes) >= MAX_NOTES:
@@ -537,7 +608,11 @@ class AuthorialWriter:
                 if entry.get("stage") == "done":
                     row["batches_done"] += 1
             row["review_flags"] += len(
-                [flag for flag in entry.get("review") or [] if flag.get("type") != "annotation"]
+                [
+                    flag
+                    for flag in entry.get("review") or []
+                    if flag.get("type") != "annotation" and not flag.get("decision")
+                ]
             )
             if row["batches_total"] > 0:
                 row["done"] = row["batches_done"] == row["batches_total"]
@@ -628,7 +703,9 @@ class AuthorialWriter:
             label = "note" if kind == "annotation" else kind
             paragraph = row.get("paragraph")
             where = f" ¶{paragraph + 1}" if isinstance(paragraph, int) else ""
-            lines.append(f"- [{label}{where}] {row.get('detail') or ''}".rstrip())
+            decision = row.get("decision") or {}
+            status = f" — {decision.get('action', '')}" if decision.get("action") else ""
+            lines.append(f"- [{label}{where}] {row.get('detail') or ''}{status}".rstrip())
         return "\n".join(lines) + "\n"
 
     def manuscript_text(self) -> str:
@@ -644,16 +721,20 @@ class AuthorialWriter:
             blocks.append("\n\n".join(lines))
         return "\n\n".join(blocks).rstrip() + ("\n" if blocks else "")
 
+    def as_report(self, meta: Dict[str, Any]) -> Dict[str, Any]:
+        """The report payload for the current writer state (used by persist)."""
+        report = dict(meta)
+        report["chapters"] = self.chapter_progress()
+        report["batches"] = self.finished
+        return report
+
     def persist(self, meta: Dict[str, Any], book_title: str = "") -> None:
         self.bilingual_path.write_text(self.bilingual_text(), encoding="utf-8")
         self.german_path.write_text(self.german_text(), encoding="utf-8")
         self.review_path.write_text(self.review_text(book_title), encoding="utf-8")
         self.manuscript_path.write_text(self.manuscript_text(), encoding="utf-8")
-        report = dict(meta)
-        report["chapters"] = self.chapter_progress()
-        report["batches"] = self.finished
         self.report_path.write_text(
-            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+            json.dumps(self.as_report(meta), ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
     @staticmethod
@@ -664,9 +745,35 @@ class AuthorialWriter:
             return None
 
 
-def _review_note(entry: Dict[str, Any], kind: str, paragraph: Optional[int], detail: str) -> None:
+def _review_note(
+    entry: Dict[str, Any], kind: str, paragraph: Optional[int], detail: str,
+    echo_against: Optional[str] = None,
+) -> None:
+    """Append one review row — filtered: no junk, no echoes, no duplicates.
+
+    The junk heuristics concern ANNOTATION notes (German conscious-change list
+    per the prompt); flag details (structure/length/check/…) are English by
+    design and must never run through the note-language heuristics.
+    """
+    if not detail or not str(detail).strip():
+        return
+    if kind == "annotation" and _is_junk_note(str(detail)):
+        return
+    if echo_against and similar_ratio(str(detail), str(echo_against)) > 0.88:
+        return  # the model echoed the paragraph text itself as a "note"
+    normalized = _norm_note(detail)
+    for row in entry.get("review") or []:
+        row_note = _norm_note(row.get("detail"))
+        if not row_note:
+            continue
+        if row_note == normalized:
+            return  # exact duplicate (any type/paragraph)
+        if row.get("type") == kind and row.get("paragraph") == paragraph and (
+            normalized in row_note or row_note in normalized
+        ):
+            return  # containment duplicate within the same flag category
     entry.setdefault("review", []).append(
-        {"type": kind, "paragraph": paragraph, "detail": detail}
+        {"type": kind, "paragraph": paragraph, "detail": str(detail)}
     )
 
 
@@ -823,6 +930,8 @@ async def run_authorial_translation(
                     text, notes, _marker = clean_model_prose(raw)
                     if not text.strip():
                         raise LlmError("draft produced no prose before ANMERKUNGEN")
+                    if is_placeholder_prose(text):
+                        raise LlmError("draft answered with a placeholder instead of prose")
                 except Exception as exc:
                     entry = {
                         "index": index,
@@ -955,6 +1064,8 @@ async def run_authorial_translation(
                             refined, note_lines, _marker = clean_model_prose(raw)
                             if not refined.strip():
                                 raise LlmError("refinement produced no prose")
+                            if is_placeholder_prose(refined):
+                                raise LlmError("refinement answered with a placeholder instead of prose")
                         except Exception as exc:
                             await _unload(refiner_profile)
                             item["error"] = str(exc)
@@ -971,7 +1082,7 @@ async def run_authorial_translation(
                         item["rounds"] = round_no
                         for note in note_lines:
                             item["notes"].append(note)
-                            _review_note(entry, "annotation", p_index, note)
+                            _review_note(entry, "annotation", p_index, note, echo_against=refined)
                         if ratio >= similarity_stop:
                             item["stopped_early"] = True
                             break

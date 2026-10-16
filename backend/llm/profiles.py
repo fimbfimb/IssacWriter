@@ -29,6 +29,15 @@ class ProfileStore:
     def get(self, profile_id: str) -> Optional[Dict[str, Any]]:
         return self._load().get(profile_id)
 
+    def find_by_name(self, name: str) -> Optional[Dict[str, Any]]:
+        wanted = (name or "").strip().casefold()
+        if not wanted:
+            return None
+        for profile in self._load().values():
+            if (profile.get("name") or "").strip().casefold() == wanted:
+                return profile
+        return None
+
     def create(self, data: Dict[str, Any]) -> Dict[str, Any]:
         profiles = self._load()
         profile_id = uuid.uuid4().hex[:8]

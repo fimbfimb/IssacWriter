@@ -7,22 +7,27 @@ import WriteTab from "../components/WriteTab";
 import StatsTab from "../components/StatsTab";
 import ProfilesTab from "../components/ProfilesTab";
 import TranslateTab from "../components/TranslateTab";
+import LayoutTab from "../components/LayoutTab";
+import SequelDialog from "../components/SequelDialog";
 
-type TabName = "outline" | "write" | "translate" | "codex" | "stats" | "models";
+type TabName = "outline" | "write" | "translate" | "codex" | "layout" | "stats" | "models";
 
 export default function BookPage({
   bookId,
   onBack,
+  onOpen,
   showToast,
 }: {
   bookId: string;
   onBack: () => void;
+  onOpen: (id: string) => void;
   showToast: (m: string) => void;
 }) {
   const [book, setBook] = useState<Book | null>(null);
   const [tab, setTab] = useState<TabName>("outline");
   const [events, setEvents] = useState<any[]>([]);
   const [runnerTick, setRunnerTick] = useState(0);
+  const [sequelOpen, setSequelOpen] = useState(false);
 
   const refreshBook = useCallback(async () => {
     try {
@@ -80,7 +85,21 @@ export default function BookPage({
             <div className="progress-inner" style={{ width: `${coverage.toFixed(1)}%` }} />
           </div>
         </div>
-        <button onClick={onBack}>← Library</button>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "flex-end" }}>
+          <button onClick={onBack}>← Library</button>
+          <button
+            disabled={(book.chapters_written ?? 0) < 1 || ["writing", "waiting_review", "generating_outline"].includes(runnerStatus)
+            }
+            title={
+              (book.chapters_written ?? 0) < 1
+                ? "Band 2 needs at least one written chapter"
+                : "Extract the ending of this book and prepare a seamless sequel"
+            }
+            onClick={() => setSequelOpen(true)}
+          >
+            ▶ Fortsetzung vorbereiten
+          </button>
+        </div>
       </div>
 
       {book.runner?.error && (
@@ -100,6 +119,9 @@ export default function BookPage({
         <button className={`tab ${tab === "translate" ? "active" : ""}`} onClick={() => setTab("translate")}>
           Translate
         </button>
+        <button className={`tab ${tab === "layout" ? "active" : ""}`} onClick={() => setTab("layout")}>
+          Layout
+        </button>
         <button className={`tab ${tab === "codex" ? "active" : ""}`} onClick={() => setTab("codex")}>
           Codex
         </button>
@@ -118,9 +140,22 @@ export default function BookPage({
       {tab === "translate" && (
         <TranslateTab book={book} events={events} refreshBook={refreshBook} showToast={showToast} />
       )}
+      {tab === "layout" && <LayoutTab book={book} showToast={showToast} />}
       {tab === "codex" && <CodexTab book={book} refreshBook={refreshBook} showToast={showToast} />}
       {tab === "stats" && <StatsTab book={book} showToast={showToast} />}
       {tab === "models" && <ProfilesTab showToast={showToast} />}
+
+      {sequelOpen && (
+        <SequelDialog
+          book={book}
+          onClose={() => setSequelOpen(false)}
+          onDone={(newId) => {
+            setSequelOpen(false);
+            onOpen(newId);
+          }}
+          showToast={showToast}
+        />
+      )}
     </div>
   );
 }

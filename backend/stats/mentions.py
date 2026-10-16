@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from ..export.cleanup import cleanup_text
 from ..store.project import BookStore
 from ..nstagent.tools import count_words
 
@@ -263,13 +264,13 @@ def export_markdown(store: BookStore, book_id: str) -> str:
     outline = book.get("outline") or {}
     if outline.get("premise"):
         lines.append("")
-        lines.append(outline["premise"])
+        lines.append(cleanup_text(outline["premise"]))
     for chapter in chapters:
         chapter_title = chapter.get("name") or f"Chapter {chapter['id']}"
         lines.append("")
         lines.append(f"## {chapter_title}")
         lines.append("")
-        lines.append(chapter.get("content", ""))
+        lines.append(cleanup_text(chapter.get("content", "")))
     return "\n".join(lines) + "\n"
 
 

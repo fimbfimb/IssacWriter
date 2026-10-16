@@ -29,7 +29,12 @@ export default function App() {
       {error && <div className="error-banner">{error}</div>}
 
       {bookId ? (
-        <BookPage bookId={bookId} onBack={() => setBookId(null)} showToast={showToast} />
+        <BookPage
+          bookId={bookId}
+          onBack={() => setBookId(null)}
+          onOpen={(id) => setBookId(id)}
+          showToast={showToast}
+        />
       ) : (
         <Library onOpen={(id) => setBookId(id)} showToast={showToast} />
       )}

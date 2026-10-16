@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api";
 import type { Book, ChapterRecord, Profile, TranslationStatus } from "../types";
+import ReviewCard from "./ReviewCard";
 
 const JUDGE_WARNING = "Use several candidate models and a separate judge model: every block is translated by each candidate, the judge picks the winning translation. Local Ollama candidates are unloaded right after each call (keep_alive: 0) so no model clogs VRAM.";
 
@@ -258,6 +259,14 @@ export default function TranslateTab({
   const tState = (statusValues?.status ?? "idle") as string;
   const toolReady = statusValues?.tool?.ready ?? true;
   const busy = tState === "running" || tState === "stopping";
+
+  const openReviewFlags = useMemo(() => {
+    const fromProgress = (chapterProgress?.chapters ?? []).reduce(
+      (sum, ch) => sum + (ch.review_flags ?? 0),
+      0,
+    );
+    return fromProgress;
+  }, [chapterProgress]);
 
   const start = async (resumeRun: boolean) => {
     if (!(book.chapters_written ?? 0)) {
@@ -665,7 +674,14 @@ tools\\bbm-venv\\Scripts\\pip install -e tools/bilingual_book_maker`}
 
       {(chapterProgress?.chapters?.length ?? 0) > 0 && (
         <div className="card">
-          <strong>Chapter progress</strong>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <strong>Chapter progress</strong>
+            {openReviewFlags > 0 && (
+              <span className="chip" style={{ color: "var(--warn)", borderColor: "var(--warn)" }}>
+                {openReviewFlags} open flags → Review
+              </span>
+            )}
+          </div>
           <div className="chapter-list-item" style={{ fontWeight: "normal" }}>
             <span className="muted" style={{ width: 26 }}></span>
             <span style={{ flex: 1 }}></span>
@@ -714,6 +730,8 @@ tools\\bbm-venv\\Scripts\\pip install -e tools/bilingual_book_maker`}
           })}
         </div>
       )}
+
+      <ReviewCard book={book} busyTranslation={busy} refreshBook={refreshBook} showToast={showToast} />
 
       <div className="card">
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 6 }}>

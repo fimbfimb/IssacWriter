@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 from openai import AsyncOpenAI
 
-_INLINE_THINKING = re.compile(r"<thinking>(?:.|\n)*?</thinking>", re.IGNORECASE)
+_INLINE_THINKING = re.compile(r"<think(?:ing)?>(?:.|\n)*?</think(?:ing)?>", re.IGNORECASE)
 
 
 def strip_inline_thinking(text: str) -> str:

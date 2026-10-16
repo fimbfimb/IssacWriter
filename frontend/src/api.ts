@@ -96,11 +96,25 @@ export const api = {
     id: string,
     data: {
       target_language: string;
+      mode?: string;
       profile_id?: string;
       single_translate?: boolean;
       test_num?: number;
       batch_size?: number;
       resume?: boolean;
+      candidate_profile_ids?: string[];
+      judge_profile_id?: string | null;
+      unload_after_call?: boolean;
+      draft_profile_id?: string;
+      refiner_profile_id?: string;
+      checker_profile_id?: string | null;
+      style_probe?: string;
+      draft_temperature?: number;
+      refine_rounds?: number;
+      similarity_stop?: number;
+      ratio_min?: number;
+      ratio_max?: number;
+      batch_words?: number;
     },
   ) =>
     request<{ status: any }>(`/api/books/${id}/translate`, {
@@ -109,6 +123,25 @@ export const api = {
     }),
   translateStatus: (id: string) =>
     request<{ status: Record<string, any> }>(`/api/books/${id}/translate/status`),
+  translateProgress: (id: string) =>
+    request<{
+      language: string;
+      mode: string | null;
+      run_status: string;
+      batches_total: number | null;
+      chapters: {
+        chapter_id: number;
+        chapter_name: string;
+        words_total: number;
+        translated_words: number;
+        batches_total: number;
+        batches_done: number;
+        paragraphs: number;
+        review_flags: number;
+        started: boolean;
+        done: boolean;
+      }[];
+    }>(`/api/books/${id}/translate/progress`),
   translateStop: (id: string) =>
     request<{ status: any }>(`/api/books/${id}/translate/stop`, { method: "POST" }),
   translateOutputs: (id: string) =>

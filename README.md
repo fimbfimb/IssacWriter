@@ -30,7 +30,7 @@ as the core engine, wrapped in a local GUI for planning, monitoring, interventio
   token/cost development, tool-usage totals, and a SVG concept graph (premise → acts → chapters with
   involved characters).
 - **Export**: manuscript as Markdown or TXT (chapter titles + prose), statistics as CSV.
-- **Translate** (one dashboard, shared LLM profiles), two modes:
+- **Translate** (one dashboard, shared LLM profiles), three modes:
   - *Single model*: turn the written manuscript into a bilingual side-by-side edition (EN↔DE and
     any target language) with the external tool
     [bilingual_book_maker](https://github.com/yihong0618/bilingual_book_maker) (**MIT** by yihong0618),
@@ -46,6 +46,15 @@ as the core engine, wrapped in a local GUI for planning, monitoring, interventio
     `ensemble_report.json` (winner, reason, token/cost totals per model); finished blocks are
     checkpointed, so stop + resume costs nothing for completed blocks. Outputs live under
     `data/<book-id>/translations/` and can be viewed/downloaded in the Translate tab.
+  - *Authorial rewrite (draft → refine → check, built-in engine)* for weak source prose: a draft
+    model renders each block freely in the target language (may re-structure sentences and replace
+    images; unclear passages are resolved to the plausible reading and reported under
+    ANMERKUNGEN), the strongest available model refines the result up to N rounds with the source
+    visible (simple prompt, stops early once rounds barely differ), and a check stage only flags —
+    a deterministic length watchdog plus an optional separate-model fidelity check. Flags and
+    annotations never auto-rewrite; they land in `review_list.md` for a human decision. Bilingual
+    output, German-only output (`book_german.txt`), stage-level checkpoints and resume as in the
+    other modes. See `uebersetzungssystem.md` for the evidence behind the pipeline.
 
 ## Run (Windows)
 

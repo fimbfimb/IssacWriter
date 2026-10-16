@@ -72,6 +72,7 @@ export type Book = {
   chapters_written?: number;
   runner?: RunnerStatus;
   translation?: TranslationStatus;
+  translation_settings?: Record<string, any>;
   author_notes?: string;
   last_error?: string;
 };

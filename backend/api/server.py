@@ -19,7 +19,7 @@ from ..nstagent.runner import RunnerRegistry
 from ..stats.mentions import build_stats, export_markdown, export_txt
 from ..store.codex import merge_extracted
 from ..store.project import BookStore
-from ..translation.runner import TranslationRegistry
+from ..translation.runner import TranslationRegistry, _slugify as slugify_language
 
 ROOT = Path(__file__).resolve().parents[2]
 DATA_ROOT = Path(os.environ.get("STORYFORGE_DATA") or ROOT / "data")
@@ -75,10 +75,10 @@ class ReviewIn(BaseModel):
 class PatchBook(BaseModel):
     title: Optional[str] = None
     story_prompt: Optional[str] = None
-    genre_notes: Optional[str] = None
     language: Optional[str] = None
     target_words: Optional[int] = None
     run_settings: Optional[Dict[str, Any]] = None
+    translation_settings: Optional[Dict[str, Any]] = None
     planner_profile_id: Optional[str] = None
     writer_profile_id: Optional[str] = None
 
@@ -107,6 +107,17 @@ class TranslateIn(BaseModel):
     test_num: int = 0
     batch_size: int = 10
     resume: bool = False
+    # authorial mode
+    draft_profile_id: Optional[str] = None
+    refiner_profile_id: Optional[str] = None
+    checker_profile_id: Optional[str] = None
+    style_probe: str = ""
+    draft_temperature: float = 0.7
+    refine_rounds: int = 2
+    similarity_stop: float = 0.97
+    ratio_min: float = 0.85
+    ratio_max: float = 1.45
+    batch_words: int = 0
 
 
 def create_app() -> FastAPI:
@@ -215,20 +226,29 @@ def create_app() -> FastAPI:
     def patch_book(book_id: str, payload: PatchBook):
         book = get_book_or_404(book_id)
         data = payload.model_dump(exclude_none=True)
-        runner = runners.get(book_id)
-        if runner._task is not None and not runner._task.done():
-            raise HTTPException(409, "runner busy; stop or wait before editing the book")
-        for key, value in data.items():
-            book[key] = value
-        outline = book.get("outline")
-        if outline is not None and data.get("target_words") and not outline.get("frozen"):
-            from ..nstagent.planner import normalize_outline_word_targets
+        translation_settings = data.pop("translation_settings", None)
+        saved = False
+        if data:
+            runner = runners.get(book_id)
+            if runner._task is not None and not runner._task.done():
+                raise HTTPException(409, "runner busy; stop or wait before editing the book")
+            for key, value in data.items():
+                book[key] = value
+            outline = book.get("outline")
+            if outline is not None and data.get("target_words") and not outline.get("frozen"):
+                from ..nstagent.planner import normalize_outline_word_targets
 
-            outline["chapters"] = normalize_outline_word_targets(
-                outline["chapters"], int(data["target_words"])
-            )
-            outline["target_words"] = int(data["target_words"])
-        store.save_book(book)
+                outline["chapters"] = normalize_outline_word_targets(
+                    outline["chapters"], int(data["target_words"])
+                )
+                outline["target_words"] = int(data["target_words"])
+            saved = True
+        if translation_settings is not None:
+            # translator settings are editable while a translation runs
+            book["translation_settings"] = translation_settings
+            saved = True
+        if saved:
+            store.save_book(book)
         return {"book": book}
 
     @app.delete("/api/books/{book_id}")
@@ -559,10 +579,84 @@ def create_app() -> FastAPI:
             config["candidates"] = candidates
             config["judge"] = dict(profile_or_404(payload.judge_profile_id)) if payload.judge_profile_id else None
             config["unload_after_call"] = payload.unload_after_call
+        elif mode == "authorial":
+            draft = dict(profile_or_404(payload.draft_profile_id)) if payload.draft_profile_id else None
+            refiner = dict(profile_or_404(payload.refiner_profile_id)) if payload.refiner_profile_id else None
+            if draft is None:
+                raise HTTPException(400, "draft_profile_id required (authorial mode)")
+            if refiner is None:
+                raise HTTPException(400, "refiner_profile_id required (authorial mode)")
+            checker = dict(profile_or_404(payload.checker_profile_id)) if payload.checker_profile_id else None
+            config["draft"] = draft
+            config["refiner"] = refiner
+            config["checker"] = checker
+            config["unload_after_call"] = payload.unload_after_call
+            config["style_probe"] = payload.style_probe
+            config["draft_temperature"] = payload.draft_temperature
+            config["refine_rounds"] = payload.refine_rounds
+            config["similarity_stop"] = payload.similarity_stop
+            config["ratio_min"] = payload.ratio_min
+            config["ratio_max"] = payload.ratio_max
+            config["batch_words"] = payload.batch_words
         else:
-            raise HTTPException(400, "mode must be 'tool' or 'ensemble'")
+            raise HTTPException(400, "mode must be 'tool', 'ensemble' or 'authorial'")
         await translations.get(book_id).start(config)
         return {"status": translations.get(book_id)._meta()}
+
+    @app.get("/api/books/{book_id}/translate/progress")
+    def translate_progress(book_id: str):
+        get_book_or_404(book_id)
+        status = translations.get(book_id)._meta()
+        language = status.get("language") or "German"
+        base = (DATA_ROOT / str(book_id) / "translations").resolve()
+        report: Dict[str, Any] | None = None
+        for name in ("authorial_report.json", "ensemble_report.json"):
+            path = base / slugify_language(language) / name
+            try:
+                candidate = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if candidate:
+                report = candidate
+                break
+        chapters: List[Dict[str, Any]] = []
+        if report and report.get("chapters"):
+            chapters = report["chapters"]
+        elif report and report.get("batches"):
+            grouped: Dict[int, Dict[str, Any]] = {}
+            for entry in report["batches"]:
+                cid = int(entry.get("chapter_id") or 0)
+                row = grouped.setdefault(
+                    cid,
+                    {
+                        "chapter_id": cid,
+                        "chapter_name": entry.get("chapter_name") or "Untitled",
+                        "batches_total": 0,
+                        "batches_done": 0,
+                        "paragraphs": 0,
+                        "review_flags": 0,
+                        "started": True,
+                        "done": False,
+                    },
+                )
+                row["batches_total"] += 1
+                done_batch = (
+                    entry.get("stage") == "done" if entry.get("stage") else bool(entry.get("winner_text"))
+                )
+                if done_batch:
+                    row["batches_done"] += 1
+                    row["paragraphs"] += sum(
+                        1 for item in (entry.get("items") or []) if item.get("text")
+                    ) or (1 if entry.get("winner_text") else 0)
+                row["done"] = row["batches_done"] == row["batches_total"]
+            chapters = [grouped[key] for key in sorted(grouped)]
+        return {
+            "language": language,
+            "mode": (report or {}).get("mode") or status.get("mode"),
+            "run_status": status.get("status"),
+            "batches_total": (report or {}).get("batches_total"),
+            "chapters": chapters,
+        }
 
     @app.get("/api/books/{book_id}/translate/status")
     def translate_status(book_id: str):

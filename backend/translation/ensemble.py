@@ -60,7 +60,7 @@ def build_batches(chapters: List[Dict[str, Any]], batch_size: int) -> List[Dict[
 def codex_glossary(book: Dict[str, Any]) -> str:
     codex = book.get("codex") or {}
     entries: List[str] = []
-    for kind in ("characters", "settings"):
+    for kind in ("characters", "settings", "lore"):
         for entry in codex.get(kind) or []:
             name = (entry.get("name") or "").strip()
             if not name:

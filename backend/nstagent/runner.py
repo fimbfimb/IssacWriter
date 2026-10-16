@@ -21,6 +21,7 @@ STATUS_PAUSED = "paused"
 STATUS_REVIEW = "waiting_review"
 STATUS_STOPPING = "stopping"
 STATUS_STOPPED = "stopped"
+STATUS_STEP = "stepped"
 STATUS_DONE = "done"
 STATUS_ERROR = "error"
 
@@ -75,6 +76,7 @@ class BookRunner:
         self._pause_event.set()
         self._stop_requested = False
         self._review_queue: Optional[asyncio.Queue] = None
+        self._abort_finalizer: Optional[asyncio.Task] = None
         self._subscribers: List[asyncio.Queue] = []
         self._current_chapter: Optional[int] = None
         self._last_event_at = 0.0
@@ -84,6 +86,7 @@ class BookRunner:
             "status": self.status,
             "error": self.error,
             "current_chapter": self._current_chapter,
+            "task_alive": bool(self._task is not None and not self._task.done()),
         }
 
     async def subscribe(self) -> asyncio.Queue:
@@ -152,6 +155,30 @@ class BookRunner:
     def request_stop(self) -> None:
         self._stop_requested = True
 
+    def request_abort(self) -> str:
+        """Abort immediately: cancel the running task and its in-flight LLM call.
+
+        Chapters and narrative state are checkpointed only after a chapter is
+        accepted, so aborting mid-chapter loses nothing that was already saved;
+        the interrupted chapter simply restarts from scratch on resume.
+        """
+        task = self._task
+        if task is None or task.done():
+            return f"nothing to abort (status {self.status})"
+        task.cancel()
+        self._abort_finalizer = asyncio.create_task(self._finalize_abort(task))
+        return f"abort requested for job '{task.get_name()}'"
+
+    async def _finalize_abort(self, task: asyncio.Task) -> None:
+        try:
+            await task
+        except BaseException:
+            pass
+        if self._task is None or self._task.done():
+            if self.status in (STATUS_OUTLINE, STATUS_WRITING):
+                self._set_status(STATUS_PAUSED)
+                await self._emit({"type": "runner_aborted"})
+
     def request_pause(self) -> None:
         self._pause_event.clear()
 
@@ -195,9 +222,11 @@ class BookRunner:
                 self._set_status(STATUS_IDLE)
             else:
                 await self._job_story(writer_profile, config)
-                self._set_status(STATUS_DONE)
+                if self.status == STATUS_WRITING:
+                    self._set_status(STATUS_DONE)
         except asyncio.CancelledError:
             self._set_status(STATUS_PAUSED)
+            await self._emit({"type": "runner_aborted"})
         except Exception as exc:
             self._set_status(STATUS_ERROR, str(exc))
             await self._emit({"type": "runner_error", "error": str(exc)})
@@ -416,6 +445,13 @@ class BookRunner:
                         "update_info": result.update_info,
                     }
                 )
+                if mode == "single":
+                    self._set_status(STATUS_STEP)
+                    await self._emit(
+                        {"type": "chapter_step_pause", "chapter_id": ch_id}
+                    )
+                    self._current_chapter = None
+                    return
                 if mode == "review" and self._has_next_chapter(chapters_plan, ch_id):
                     decision = await self._wait_review(ch_id)
                     action = decision.get("action", "approve")

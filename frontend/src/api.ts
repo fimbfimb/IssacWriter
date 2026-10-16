@@ -40,6 +40,11 @@ export const api = {
 
   replaceCodex: (id: string, codex: Codex) =>
     request<{ codex: Codex }>(`/api/books/${id}/codex`, { method: "PUT", body: JSON.stringify(codex) }),
+  extractCodex: (id: string, plannerProfileId: string) =>
+    request<{ codex: Codex; added: Record<string, number>; added_names: Record<string, { added: string[] }> }>(
+      `/api/books/${id}/codex/extract`,
+      { method: "POST", body: JSON.stringify({ planner_profile_id: plannerProfileId }) },
+    ),
 
   generateOutline: (id: string, plannerProfileId: string) =>
     request<{ status: any }>(`/api/books/${id}/outline/generate`, {
@@ -61,6 +66,8 @@ export const api = {
   runPause: (id: string) => request<{ status: any }>(`/api/books/${id}/run/pause`, { method: "POST" }),
   runResume: (id: string) => request<{ status: any }>(`/api/books/${id}/run/resume`, { method: "POST" }),
   runStop: (id: string) => request<{ status: any }>(`/api/books/${id}/run/stop`, { method: "POST" }),
+  runAbort: (id: string) =>
+    request<{ status: any; message: string }>(`/api/books/${id}/run/abort`, { method: "POST" }),
   runReview: (id: string, decision: { action: string; content?: string; note?: string }) =>
     request<{ status: any }>(`/api/books/${id}/run/review`, { method: "POST", body: JSON.stringify(decision) }),
   runStatus: (id: string) => request<{ status: any }>(`/api/books/${id}/run/status`),

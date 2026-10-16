@@ -75,6 +75,17 @@ export default function OutlineTab({
     }
   };
 
+  const abortGeneration = async () => {
+    if (!window.confirm("Abort the outline generation now? The in-flight LLM call is cut; already completed stages are kept.")) return;
+    try {
+      await api.runAbort(book.id);
+      showToast("Outline generation aborted — completed stages kept, change the profile and generate again");
+      refreshBook();
+    } catch (err: any) {
+      showToast(err.message);
+    }
+  };
+
   const saveOutlineText = async (key: "premise" | "synopsis" | "acts", value: string) => {
     await api.patchOutline(book.id, { [key]: value });
     showToast(`${key} saved`);
@@ -161,6 +172,16 @@ export default function OutlineTab({
           )}
         </div>
         {stageInfo() && <div className="inline-note">{stageInfo()}</div>}
+        {book.runner?.status === "generating_outline" && (
+          <div style={{ display: "flex", gap: 8, marginTop: 8, alignItems: "center" }}>
+            <button className="btn-danger" onClick={abortGeneration}>
+              ◼ Abort generation
+            </button>
+            <span className="muted" style={{ fontSize: 12 }}>
+              stops the in-flight LLM call immediately; finished stages stay saved — switch the profile and rerun
+            </span>
+          </div>
+        )}
         {(book.runner?.status === "generating_outline" || hasStream) && (
           <div style={{ marginTop: 10 }}>
             <LiveStreamBox events={events} active={book.runner?.status === "generating_outline"} height={200} />

@@ -67,7 +67,7 @@ export default function WriteTab({
   const [notes, setNotes] = useState(book.author_notes ?? "");
   const [reviewContent, setReviewContent] = useState("");
   const [reviewNote, setReviewNote] = useState("");
-  const [mode, setMode] = useState<"auto" | "review">(book.run_settings?.mode ?? "auto");
+  const [mode, setMode] = useState<"auto" | "review" | "single">(book.run_settings?.mode ?? "auto");
   const feedRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -223,21 +223,22 @@ export default function WriteTab({
                 ))}
               </select>
             </div>
-            <div className="form-col" style={{ minWidth: 200 }}>
+            <div className="form-col" style={{ minWidth: 220 }}>
               <label>Run mode</label>
               <select value={mode} onChange={(e) => setMode(e.target.value as any)} disabled={busy}>
                 <option value="auto">Full auto — write all chapters</option>
                 <option value="review">Review each chapter</option>
+                <option value="single">Single step — write one chapter</option>
               </select>
             </div>
           </div>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
             {!busy && (
               <button className="btn-primary" onClick={startRun}>
-                ▶ Start writing
+                {mode === "single" && (book.chapters_written ?? 0) > 0 ? "▶ Write next chapter" : "▶ Start writing"}
               </button>
             )}
-            {runnerStatus === "writing" && (
+            {(runnerStatus === "writing" || runnerStatus === "generating_outline") && (
               <>
                 <button onClick={() => runnerAction(api.runPause.bind(null, book.id), "Pausing after this chapter")}>
                   ⏸ Pause
@@ -245,23 +246,33 @@ export default function WriteTab({
                 <button className="btn-danger" onClick={() => runnerAction(api.runStop.bind(null, book.id), "Stopping after this chapter")}>
                   ⏹ Stop
                 </button>
+                <button
+                  className="btn-danger"
+                  onClick={() => {
+                    if (!window.confirm("Abort now? The in-flight LLM call is cut immediately. The current chapter restarts from scratch on the next start.")) return;
+                    runnerAction(api.runAbort.bind(null, book.id), "Aborted");
+                  }}
+                >
+                  ◼ Abort now
+                </button>
               </>
             )}
-            {runnerStatus === "paused" && (
+            {runnerStatus === "paused" && book.runner?.task_alive && (
               <button className="btn-primary" onClick={() => runnerAction(api.runResume.bind(null, book.id), "Resumed")}>
                 ▶ Resume
               </button>
             )}
-            {(runnerStatus === "done" || runnerStatus === "stopped") && (
+            {["done", "stopped", "stepped"].includes(runnerStatus) ||
+            (runnerStatus === "paused" && !book.runner?.task_alive) ? (
               <button className="btn-primary" onClick={startRun}>
-                ▶ Continue writing
+                {mode === "single" ? "▶ Write next chapter" : "▶ Continue writing"}
               </button>
-            )}
+            ) : null}
           </div>
         </div>
         <div className="inline-note">
           {chapters.length} of {chaptersPlanned} chapters written · {totalWords.toLocaleString()} words · the state,
-          chapters and metrics checkpoint after every chapter — you can pause, stop or close the browser anytime.
+          chapters and metrics checkpoint after every chapter — you can pause, stop, abort or close the browser anytime.
         </div>
       </div>
 

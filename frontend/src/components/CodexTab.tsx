@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
-import type { Book, Codex, CodexEntry, StateCollection } from "../types";
+import type { Book, Codex, CodexEntry, Profile, StateCollection } from "../types";
 
 const EMPTY_ENTRY: CodexEntry = { name: "", aliases: [], description: "", role: "", color: "" };
 
@@ -103,6 +103,8 @@ export default function CodexTab({
   const [codex, setCodex] = useState<Codex>(book.codex ?? { characters: [], settings: [], lore: [] });
   const [state, setState] = useState<StateCollection | null>(null);
   const [dirty, setDirty] = useState(false);
+  const [profiles, setProfiles] = useState<Profile[]>([]);
+  const [extracting, setExtracting] = useState(false);
 
   useEffect(() => setCodex(book.codex ?? { characters: [], settings: [], lore: [] }), [book.id]);
   useEffect(() => {
@@ -110,7 +112,41 @@ export default function CodexTab({
       .getState(book.id)
       .then((r) => setState(r.state))
       .catch(() => {});
+    api
+      .listProfiles()
+      .then((r) => setProfiles(r.profiles))
+      .catch(() => {});
   }, [book.id, book.chapters_written]);
+
+  const extractionProfileId = book.planner_profile_id ?? profiles[0]?.id ?? "";
+
+  const extractFromOutline = async () => {
+    if (!book.outline?.premise) {
+      showToast("No outline yet — generate it first (Outline tab)");
+      return;
+    }
+    if (!extractionProfileId) {
+      showToast("Create an LLM profile first (tab: LLM Profiles)");
+      return;
+    }
+    setExtracting(true);
+    try {
+      const result = await api.extractCodex(book.id, extractionProfileId);
+      setCodex(result.codex);
+      setDirty(false);
+      const addedNames = result.added_names?.characters?.added ?? [];
+      showToast(
+        `Extraction done: +${result.added.characters} characters, +${result.added.settings} settings${
+          addedNames.length ? ` (${addedNames.join(", ")})` : " (all already present)"
+        } — now edit appearance, voice, goals`,
+      );
+      refreshBook();
+    } catch (err: any) {
+      showToast(`Extraction failed: ${err.message}`);
+    } finally {
+      setExtracting(false);
+    }
+  };
 
   const save = async () => {
     try {
@@ -153,9 +189,18 @@ export default function CodexTab({
               aliases also power the mention statistics in the Statistics tab.
             </div>
           </div>
-          <button className="btn-primary" disabled={!dirty} onClick={save}>
-            {dirty ? "Save codex" : "Saved"}
-          </button>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <button
+              disabled={extracting || !book.outline?.premise}
+              title="Let the planner LLM read the outline and create codex entries for every character and setting it uses. Your own entries are never touched."
+              onClick={extractFromOutline}
+            >
+              {extracting ? "Extracting…" : "✦ Extract from outline"}
+            </button>
+            <button className="btn-primary" disabled={!dirty} onClick={save}>
+              {dirty ? "Save codex" : "Saved"}
+            </button>
+          </div>
         </div>
       </div>
 

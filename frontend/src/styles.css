@@ -126,7 +126,7 @@ button:disabled { opacity: 0.45; cursor: default; }
 }
 .chip.status-idle { color: var(--text-dim); }
 .chip.status-writing, .chip.status-generating_outline { color: var(--accent); border-color: var(--accent); }
-.chip.status-paused, .chip.status-stopped, .chip.status-stopping { color: var(--warn); border-color: var(--warn); }
+.chip.status-paused, .chip.status-stopped, .chip.status-stopping, .chip.status-stepped { color: var(--warn); border-color: var(--warn); }
 .chip.status-waiting_review { color: var(--good); border-color: var(--good); }
 .chip.status-error { color: var(--bad); border-color: var(--bad); }
 .chip.status-done { color: var(--good); border-color: var(--good); }

@@ -43,7 +43,7 @@ export type Outline = {
 };
 
 export type RunSettings = {
-  mode: "auto" | "review";
+  mode: "auto" | "review" | "single";
   temperature: number;
   dynamic_tokens: boolean;
   hard_max_output_tokens: number;
@@ -89,6 +89,7 @@ export type RunnerStatus = {
   status: string;
   error: string | null;
   current_chapter: number | null;
+  task_alive?: boolean;
 };
 
 export type ChapterRecord = {

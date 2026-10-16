@@ -1,4 +1,4 @@
-# StoryForge — NstAgent Book Writing Studio
+# IsaacWriter — NstAgent Book Writing Studio
 
 Write full-length books (10K–100K+ words) with LLMs, using the method from the paper
 *"Scaling Long-Form Story Generation via Narrative State Tracking"* (NstAgent, arXiv 2609.35759)
@@ -58,7 +58,7 @@ Development mode (hot reload): run the backend as above plus `npm run dev` in `f
 
 ## How the paper protocol maps to the app
 
-| Paper (NstAgent) | StoryForge |
+| Paper (NstAgent) | IsaacWriter |
 |---|---|
 | Planner stages 1–4 with frozen outline | Outline tab, `backend/nstagent/planner.py` |
 | State `sₜ=(Cₜ,Pₜ,Fₜ)` with 4-array atomic update | `backend/nstagent/state.py`, `update` tool in `agent.py` |

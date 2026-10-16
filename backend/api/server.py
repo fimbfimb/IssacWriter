@@ -13,9 +13,11 @@ from pydantic import BaseModel, Field
 
 from ..llm.provider import LlmClient, LlmError, LlmProfile
 from ..llm.profiles import ProfileStore
+from ..llm.provider import extract_json
 from ..nstagent.prompts import CHAPTER_ANCHORS, MAX_CORRECT_PER_CHAPTER, MAX_READ, MAX_SEARCH, MAX_TURNS_PER_CHAPTER, SEARCH_MAX_HITS
 from ..nstagent.runner import RunnerRegistry
 from ..stats.mentions import build_stats, export_markdown, export_txt
+from ..store.codex import merge_extracted
 from ..store.project import BookStore
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -91,7 +93,7 @@ class StatePatch(BaseModel):
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="StoryForge", version="0.1.0")
+    app = FastAPI(title="IsaacWriter", version="0.1.0")
     store = BookStore(DATA_ROOT)
     profiles = ProfileStore(DATA_ROOT / "profiles.json")
     runners = RunnerRegistry(store)
@@ -112,7 +114,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/health")
     def health():
-        return {"ok": True, "app": "StoryForge"}
+        return {"ok": True, "app": "IsaacWriter"}
 
     @app.get("/api/settings")
     def settings():
@@ -225,6 +227,71 @@ def create_app() -> FastAPI:
         book["codex"] = payload.model_dump()
         store.save_book(book)
         return {"codex": book["codex"]}
+
+    @app.post("/api/books/{book_id}/codex/extract")
+    async def extract_codex(book_id: str, payload: RunConfigIn):
+        book = get_book_or_404(book_id)
+        outline = book.get("outline") or {}
+        if not outline.get("premise"):
+            raise HTTPException(400, "no outline to extract from")
+        profile_id = (
+            payload.planner_profile_id
+            or book.get("planner_profile_id")
+        )
+        profile = profile_or_404(profile_id)
+        if profile is None:
+            raise HTTPException(400, "planner_profile_id required for extraction")
+
+        parts: List[str] = [f"Premise:\n{outline.get('premise', '')}"]
+        if outline.get("synopsis"):
+            parts.append(f"Detailed synopsis:\n{outline['synopsis']}")
+        if outline.get("acts"):
+            parts.append(f"Acts:\n{outline['acts']}")
+        chapters = outline.get("chapters") or []
+        if chapters:
+            compact = [
+                f"{ch.get('name', '')}: {ch.get('description', '')}" for ch in chapters
+            ]
+            parts.append("Chapters:\n" + "\n".join(compact))
+        codex = book.get("codex") or {}
+        existing_characters = ", ".join(c.get("name", "") for c in codex.get("characters") or []) or "none yet"
+        existing_settings = ", ".join(c.get("name", "") for c in codex.get("settings") or []) or "none yet"
+
+        messages = [
+            {
+                "role": "system",
+                "content": "You extract story entities from a novel outline and respond ONLY with JSON.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Outline:\n\n" + "\n\n".join(parts) + "\n\n"
+                    f"Already authored codex entries (characters: {existing_characters}; settings: {existing_settings}) — "
+                    "do not repeat them.\n\n"
+                    "Extract every named character that drives the plot (4-12, main and memorable supporting cast) "
+                    "and every named location or setting that matters (2-8). Respond ONLY as JSON:\n"
+                    "{\n"
+                    '  "characters": [{"name": "Full Name", "aliases": ["short spellings used in the outline"], '
+                    '"role": "protagonist|antagonist|supporting|...", "description": "1-2 sentences: who they are and what they want"}],\n'
+                    '  "settings": [{"name": ...,"aliases": [...], "description": "1 sentence"}]\n'
+                    "}\n"
+                    "Rules: only entities actually present in the outline; aliases must include spellings the outline "
+                    "itself uses; write descriptions in the same language as the outline; keep names stable across chapters."
+                ),
+            },
+        ]
+        client = LlmClient(LlmProfile(**profile))
+        try:
+            response = await client.chat(messages, temperature=0.3)
+            payload_json = extract_json(response.content)
+        except (LlmError, ValueError) as exc:
+            raise HTTPException(502, f"extraction failed: {exc}")
+        if not isinstance(payload_json, dict):
+            raise HTTPException(502, "extraction produced no JSON object")
+        report = merge_extracted(book["codex"], payload_json)
+        store.save_book(book)
+        added = {kind: len(values["added"]) for kind, values in report.items()}
+        return {"codex": book["codex"], "added": added, "added_names": report}
 
     @app.post("/api/books/{book_id}/outline/generate")
     async def generate_outline(book_id: str, payload: RunConfigIn):
@@ -409,6 +476,13 @@ def create_app() -> FastAPI:
         if runner._task is not None and not runner._task.done():
             runner.request_resume()
         return {"status": runner._meta()}
+
+    @app.post("/api/books/{book_id}/run/abort")
+    async def run_abort(book_id: str):
+        get_book_or_404(book_id)
+        runner = runners.get(book_id)
+        message = runner.request_abort()
+        return {"status": runner._meta(), "message": message}
 
     @app.post("/api/books/{book_id}/run/review")
     async def run_review(book_id: str, payload: ReviewIn):

@@ -65,7 +65,7 @@ class ChapterSearchIndex:
                 sentence_text UNINDEXED,
                 after_text UNINDEXED,
                 tokens,
-                tokenize='unicode61 remove_symbols'
+                tokenize='unicode61'
             )
             """
         )

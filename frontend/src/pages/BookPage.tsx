@@ -7,10 +7,11 @@ import WriteTab from "../components/WriteTab";
 import StatsTab from "../components/StatsTab";
 import ProfilesTab from "../components/ProfilesTab";
 import TranslateTab from "../components/TranslateTab";
+import RefinerTab from "../components/RefinerTab";
 import LayoutTab from "../components/LayoutTab";
 import SequelDialog from "../components/SequelDialog";
 
-type TabName = "outline" | "write" | "translate" | "codex" | "layout" | "stats" | "models";
+type TabName = "outline" | "write" | "refine" | "translate" | "codex" | "layout" | "stats" | "models";
 
 export default function BookPage({
   bookId,
@@ -46,7 +47,7 @@ export default function BookPage({
     const close = openEventStream(bookId, (event) => {
       setEvents((prev) => [...prev.slice(-500), event]);
       setRunnerTick((t) => t + 1);
-      if (["outline_done", "chapter_done", "runner_stopped", "runner_error", "translation_done", "translation_error"].includes(event.type)) {
+      if (["outline_done", "chapter_done", "runner_stopped", "runner_error", "translation_done", "translation_error", "refine_done", "refine_error", "outline_refine_done", "outline_refine_error"].includes(event.type)) {
         refreshBook();
       }
     });
@@ -116,6 +117,9 @@ export default function BookPage({
         <button className={`tab ${tab === "write" ? "active" : ""}`} onClick={() => setTab("write")}>
           Write
         </button>
+        <button className={`tab ${tab === "refine" ? "active" : ""}`} onClick={() => setTab("refine")}>
+          Refine
+        </button>
         <button className={`tab ${tab === "translate" ? "active" : ""}`} onClick={() => setTab("translate")}>
           Translate
         </button>
@@ -136,6 +140,9 @@ export default function BookPage({
       {tab === "outline" && <OutlineTab book={book} events={events} refreshBook={refreshBook} showToast={showToast} />}
       {tab === "write" && (
         <WriteTab book={book} events={events} refreshBook={refreshBook} showToast={showToast} />
+      )}
+      {tab === "refine" && (
+        <RefinerTab book={book} events={events} refreshBook={refreshBook} showToast={showToast} />
       )}
       {tab === "translate" && (
         <TranslateTab book={book} events={events} refreshBook={refreshBook} showToast={showToast} />

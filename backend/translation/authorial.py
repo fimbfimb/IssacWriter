@@ -33,9 +33,146 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from ..llm.provider import LlmClient, LlmError, LlmProfile, extract_json, strip_inline_thinking
-from .ensemble import TranslationStopped, codex_glossary, style_context, unload_ollama_profile
+from .ensemble import (
+    TranslationStopped,
+    codex_glossary,
+    signal_call,
+    style_context,
+    unload_ollama_profile,
+)
 
 DRAFT_TEMPERATURE = 0.7
+REFINE_TEMPERATURE = 0.2
+CHECK_TEMPERATURE = 0.0
+
+STRUCTURED_TOOL_NAME = "translation_output"
+STRUCTURED_TOOL: Dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": STRUCTURED_TOOL_NAME,
+        "description": "Deliver the target-language result of this step. text = the final prose; notes = ONLY conscious changes you made, short, in the target language; empty when unsure.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "The final prose of this step (no meta, no reasoning)."},
+                "notes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Conscious deviations from a word-by-word rendering, each one short line in the target language. Empty list means nothing to report.",
+                },
+            },
+            "required": ["text"],
+        },
+    },
+}
+
+
+def _clean_notes(raw_notes) -> List[str]:
+    """Shared note cleanup for the structured channels: drop empties, single
+    characters (broken formatting), and junk/self-talk lines. Long notes stay
+    (long_ok) — at parse time they are the rescue candidates for the actual
+    translation; the display filter hides leftover long drafts later."""
+    notes: List[str] = []
+    for stripped in (str(row).strip() for row in (raw_notes or [])):
+        if not stripped:
+            continue
+        if len(stripped) <= 1:
+            continue
+        if _is_junk_note(stripped, long_ok=True):
+            continue
+        notes.append(stripped)
+    return notes
+
+
+def _rescue_text_from_notes(notes: List[str]) -> Optional[Tuple[str, List[str]]]:
+    """Degenerate model behaviour: the translation lands in the notes field and
+    the text field holds "[blank]". When the text is a placeholder, the longest
+    notes item that cleans into real prose becomes the text."""
+    for candidate in sorted(notes, key=len, reverse=True):
+        head, leftover, _marker = clean_model_prose(candidate)
+        head = head.strip()
+        if len(head) < 80 or is_placeholder_prose(head):
+            continue
+        if not re.search(r"[.!?…]", head):
+            continue
+        remaining = [note for note in notes if note != candidate]
+        if isinstance(leftover, list):
+            remaining.extend(s for s in leftover if s.strip() and not _is_junk_note(s.strip(), long_ok=True))
+        else:
+            leftover = str(leftover).strip()
+            if leftover and len(leftover) > 40 and not _is_junk_note(leftover, long_ok=True):
+                remaining.append(leftover)
+        return head, remaining
+    return None
+
+
+def parse_structured(response: "LlmResponse") -> Tuple[str, List[str]]:
+    """Prose + notes from THREE channels in order: tool call → content JSON →
+    legacy TEXT/ANMERKUNGEN protocol. Reasoning in `content` is ignored
+    whenever a tool call or JSON payload is present. If the text field holds a
+    placeholder while the notes carry the real prose, the prose is rescued."""
+    text: Optional[str] = None
+    notes: List[str] = []
+    for call in response.tool_calls or []:
+        if (call.name or "") != STRUCTURED_TOOL_NAME:
+            continue
+        try:
+            payload = json.loads(call.arguments or "{}")
+        except json.JSONDecodeError:
+            continue
+        text = strip_inline_thinking(str(payload.get("text") or "")).strip()
+        notes = _clean_notes(payload.get("notes"))
+        break
+    if text is None:
+        content = (response.content or "").strip()
+        try:
+            payload = extract_json(content)
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict) and str(payload.get("text") or "").strip():
+            text = strip_inline_thinking(str(payload.get("text") or "")).strip()
+            notes = _clean_notes(payload.get("notes"))
+    if text is None:
+        # legacy plain-prose fallback (old reports, endpoints without tool support)
+        text, notes, _marker = clean_model_prose(content)
+    if text is not None and (is_placeholder_prose(text) or not text.strip()):
+        rescued = _rescue_text_from_notes(notes)
+        if rescued is not None:
+            text, notes = rescued
+    if text is None:
+        text = ""
+    return text, notes
+
+
+async def call_structured(
+    client: "LlmClient",
+    messages: List[Dict[str, Any]],
+    temperature: float,
+    structured: bool = True,
+):
+    """One draft/refine call. Structured mode prefers the tool channel and
+    falls back to JSON, then to the legacy prose protocol. Returns
+    (text, notes, usage); empty text raises LlmError."""
+    if structured:
+        response = await client.chat(
+            messages,
+            tools=[STRUCTURED_TOOL],
+            tool_choice="auto",
+            temperature=temperature,
+        )
+        text, notes = parse_structured(response)
+        if not text.strip():
+            raise LlmError("empty output (no text in tool call, JSON or prose)")
+        if is_placeholder_prose(text):
+            raise LlmError("output was a placeholder instead of prose")
+        return text, notes, response.usage
+    response = await client.chat(messages, temperature=temperature)
+    text, notes, _marker = clean_model_prose((response.content or "").strip())
+    if not text.strip():
+        raise LlmError("draft produced no prose before ANMERKUNGEN")
+    if is_placeholder_prose(text):
+        raise LlmError("draft answered with a placeholder instead of prose")
+    return text, notes, response.usage
 DEFAULT_DRAFT_TEMPERATURE = DRAFT_TEMPERATURE
 REFINE_TEMPERATURE = 0.2
 CHECK_TEMPERATURE = 0.0
@@ -44,6 +181,11 @@ DEFAULT_SIMILARITY_STOP = 0.97
 DEFAULT_RATIO_MIN = 0.85
 DEFAULT_RATIO_MAX = 1.45
 DEFAULT_MIN_WORDS = 250
+# "essential": translate, full stop — no length/fidelity scoring, flags only for
+# truly broken output. "strict": the old scoring review for those who want it.
+CHECK_MODE_ESSENTIAL = "essential"
+CHECK_MODE_STRICT = "strict"
+CHECK_MODES = (CHECK_MODE_ESSENTIAL, CHECK_MODE_STRICT)
 MAX_NOTES = 12
 _MAX_REVIEW_LINES_EMITTED = 8
 
@@ -53,12 +195,29 @@ _EMPTY_NOTE_VALUES = ("", "keine", "keine.", "none", "none.", "-", "—", "gut",
 # the marker is model self-talk that must not reach the review GUI: instructions
 # to itself, self-checks, punctuation notes, protocol tokens.
 _META_NOTE = re.compile(
-    r"^[#>*\-\s]*(?:keep it short|no analysis|no english|one more|punctuation[ :\s:]"
-    r"|length[ :\s:]|l\u00e4nge[ :\s:]|double[-\s]?check|also consider|final answer"
-    r"|finale? fassung|scan for|repeat check|count of|note:)",
+    r"keep it short|no analysis|no english|one more (?:scan|check|look)|punctuation[ :\s]"
+    r"|length[ :]|l\u00e4nge[ :]|double[-\s]?check|also (?:consider|check|double)"
+    r"|consider (?:adding|using)|final answer|write final|finale? fassung"
+    r"|scan for|repeat check|count of|note:|assemble",
     re.IGNORECASE,
 )
 _PROTOCOL_TAIL = re.compile(r"[\s.:!\-]*(?:TEXT|ANTWORT|ANSWER)\s*", re.IGNORECASE)
+# chain-of-thought structure lines: "X: alternative", "1 ✓", "Done.", "…TEXT"
+_PROCESS_LINE = re.compile(r"^[A-Z]{1,3}\s*[:\uff1a]\s", re.IGNORECASE)
+_ENDS_PROTOCOL = re.compile(r"\b(?:TEXT|ANTWORT|ANSWER)\s*$", re.IGNORECASE)
+_CHECKMARK_ONLY = re.compile(r"^[\d.\s]*[\u2713\u2714]?\s*$")
+_DONE_PREFIX = re.compile(r"^done[\s.,:!]", re.IGNORECASE)
+# executed-change vocabulary: mixed-language notes containing one of these
+# german stems are reported changes, not reasoning leaks
+_HAS_CHANGE_VERB = re.compile(
+    r"ge[äa]ndert|ge[äa]nd|ersetz|entfernt|entfern|vereinfach|beibehal|erg[äa]nz"
+    r"|formulier|gebaut|gebau|gestaucht|gestraff|gek[üu]rzt|gek[üu]rz|umgebaut"
+    r"|verfeinert|verfein|verdicht|glattgezogen|gl[äa]tt|korrigiert|korrig"
+    r"|angepasst|angepas|verschob|verlagert|verl[äa]ngert|verbessert|verbess"
+    r"|behoben|behob|gegl[äa]ttet|r[üu]ckgebaut|aufgegeben|aufgel[öo]st"
+    r"|\u2192|->|gestrichen",
+    re.IGNORECASE,
+)
 
 _ANNOTATION_MARKER = re.compile(r"^[ \t]*[#*>-]*[ \t]*ANMERKUNGEN\b", re.IGNORECASE)
 _BULLET_PREFIX = re.compile(r"^[ \t]*(?:[-*••]|\d+[.)])[ \t]+")
@@ -290,26 +449,44 @@ def _norm_note(value: str) -> str:
     return re.sub(r"\s+", " ", (value or "").strip().casefold())
 
 
-def _is_junk_note(note: str) -> bool:
+def _is_junk_note(note: str, long_ok: bool = False) -> bool:
     """Protocol leftovers / self-talk that never is a conscious-change note.
 
     The ANMERKUNGEN section is a German list per the prompt mandate: notes are
-    conscious changes the model made. English reasoning that leaks into the
-    notes section is therefore junk — a note with at least one English sentence
-    and zero German sentences is a leak. Language-neutral short notes
-    ("Bild ersetzt" has no marker tokens at all) stay.
+    conscious changes the model made. Everything else is reasoning that leaked
+    in and is dropped: meta self-instructions, chain-of-thought structure lines
+    ("X: alternative", "1 ✓", "Done.", "Assemble final …"), pure English
+    rumination, and mixed pondering without an executed-change verb. Language-
+    neutral short notes ("Bild ersetzt") and before→after change notations stay.
     """
     value = (note or "").strip()
     if not value:
         return True
+    if len(value) <= 1:
+        return True  # broken formatting: single characters are never notes
     if _ANNOTATION_MARKER.match(value) or _PROTOCOL_MARKER_LINE.match(value) or _ANSWER_MARKER_LINE.match(value):
         return True
-    if _META_NOTE.match(value):
+    if _META_NOTE.search(value):  # anywhere: "Also double check …", "hmm: …"
         return True
     if _TRAILER_META.match(value):
         return True
-    cleaned = _PROTOCOL_TAIL.sub(" ", value).strip(" .,;:!")
+    if _PROCESS_LINE.match(value):  # "X: …", "Y: …" alternative drafts
+        return True
+    if _DONE_PREFIX.match(value):  # "Done. Write final answer."
+        return True
+    if _CHECKMARK_ONLY.match(value):  # "1 ✓", "✓"
+        return True
+    if _ENDS_PROTOCOL.search(value):  # "… repeated of original. Good.TEXT"
+        return True
+    cleaned = _PROTOCOL_TAIL.sub(" ", value).strip(" .,;:!").rstrip() or value
     if cleaned.lower() in _EMPTY_NOTE_VALUES:
+        return True
+    # a long note is NEVER a change note (they are one short sentence): it is
+    # an alternative draft or an echoed paragraph from the chain of thought —
+    # even when prose words inside accidentally match a change verb.
+    # Exception (long_ok=True): parse time — long notes are rescue candidates
+    # for the actual translation and must survive until the rescue decides.
+    if len(value) >= 200 and not long_ok:
         return True
     sentences = [s for s in re.findall(r"[^.!?…]+[.!?…]*", cleaned) if s.strip()]
     languages = [_sentence_language(s) for s in sentences]
@@ -319,12 +496,11 @@ def _is_junk_note(note: str) -> bool:
         # no english reasoning signal: german or language-neutral notes pass
         # ("Bild ersetzt" has no marker tokens and stays)
         return False
-    if german_count == 0:
-        return True  # pure english in a german-mandated notes section: leak
-    # mixed (e.g. german result + quoted english phrase): executed changes
-    # name a german change verb; pondering/self-check leaks ("at the door …
-    # → At the door he slowed down. Good") do not
-    return not _HAS_CHANGE_VERB.search(cleaned)
+    # english present: an executed change is reported as before→after — such
+    # notes (also pure english ones, e.g. "They → man begrub") stay visible
+    if _HAS_CHANGE_VERB.search(cleaned):
+        return False
+    return True  # rumination without an executed change
 
 
 def parse_annotated_output(raw: str) -> Tuple[str, List[str], bool]:
@@ -352,6 +528,8 @@ def parse_annotated_output(raw: str) -> Tuple[str, List[str], bool]:
         if not line.strip():
             continue
         note = _BULLET_PREFIX.sub("", line.strip()).strip().rstrip(".,;")
+        if len(note) <= 1:
+            continue  # broken formatting: single characters are never notes
         if note.strip().lower() in _EMPTY_NOTE_VALUES:
             continue
         if _is_junk_note(note):
@@ -436,9 +614,13 @@ def draft_messages(
         "  or a passive (\"They buried\" → \"Man begrub …\").\n"
         "- Output exactly one paragraph per input paragraph, same order. Lines of the form \"Chapter N:\n"
         "  Title\" are chapter headings: render them as headings.\n"
-        "- After the TEXT line, output ONLY the text. Then one line \"ANMERKUNGEN:\" with a short list of\n"
-        "  conscious changes (or \"keine\"). No analysis, no explanations, no English reasoning, never\n"
-        "  state the final text twice."
+        "- Abgabe des Ergebnisses: Rufe das Tool `translation_output` auf — {\"text\": <der komplette\n"
+        "  Zieltext>, \"notes\": [<bewusste Änderungen, je ein kurzer Satz auf Deutsch>]}. notes bleibt\n"
+        "  leer, wenn du nichts bewusst abgewandelt hast. Kein Denken im text-Feld.\n"
+        "  Unterstützt dein Endpunkt keine Tool-Calls, antworte NUR mit einem JSON-Objekt\n"
+        "  {\"text\": \"...\", \"notes\": [...]}. Geht auch das nicht: erste Zeile TEXT, danach nur der\n"
+        "  Zieltext, dann \"ANMERKUNGEN:\" mit der Liste (oder \"keine\"). Keine Analyse, keine\n"
+        "  Erklärungen, kein englisches Nachdenken im Zieltext oder in den Notizen."
     )
     return [
         {"role": "system", "content": "\n".join(system_parts)},
@@ -472,9 +654,11 @@ def refine_messages(
         "  Verstärker (\"ganz\", \"sogar\"). Unpersönliches \"they\" wird zu \"man …\" oder Passiv, nie zu\n"
         "  \"Sie begruben …\". Eigennamen unverändert.\n"
         "- Englisch gebaute Lange Sätze zerlegst du; Partizipialketten werden zu finiten Verben.\n"
-        "- Beginne mit einer einzelnen Zeile, die genau enthält: TEXT\n"
-        "- Danach NUR der neue Text (optional ANMERKUNGEN: für bewusste Änderungen). Keine Analyse, kein\n"
-        "  englischer Text, keine Wiederholung."
+        "- Abgabe: Rufe das Tool `translation_output` auf — {\"text\": <neue Fassung>, \"notes\":\n"
+        "  [<maximal eine kurze Änderungsnotiz, auf Deutsch>]}. Kein Denken im text-Feld; keine\n"
+        "  Tool-Calls möglich, dann antworte NUR mit einem JSON-Objekt {\"text\": \"...\", \"notes\":\n"
+        "  [...]}; als letzten Notfall: erste Zeile TEXT, danach nur der Zieltext, dann\n"
+        "  ANMERKUNGEN. Keine Analyse, kein englischer Text, keine Wiederholung."
     )
     return [
         {
@@ -728,6 +912,55 @@ class AuthorialWriter:
         report["batches"] = self.finished
         return report
 
+    def write_chapter_files(self) -> None:
+        """Per-chapter files, refreshed after EVERY persist: chapters_de/chNNNN.md
+        (German prose incl. heading) + chapters_en/chNNNN.md (source). So each
+        finished (and partially translated) chapter survives on disk regardless
+        of what happens to the report afterwards."""
+        base = self.report_path.parent
+        de_dir = base / "chapters_de"
+        en_dir = base / "chapters_en"
+        by_chapter: Dict[int, List[Dict[str, Any]]] = {}
+        for entry in self.finished:
+            cid = entry.get("chapter_id")
+            if cid is None:
+                continue
+            by_chapter.setdefault(int(cid), []).append(entry)
+        for cid, chapter in (self._chapters or {}).items():
+            cid = int(cid)
+            entries = sorted(by_chapter.get(cid) or [], key=lambda e: int(e.get("index") or 0))
+            has_prose = any(
+                (item.get("text") or "").strip()
+                for entry in entries
+                for item in entry.get("items") or []
+            )
+            de_path = de_dir / f"ch{cid:04d}.md"
+            en_path = en_dir / f"ch{cid:04d}.md"
+            if not has_prose:
+                # nothing translated yet (fresh placeholder/reset) → no files
+                de_path.unlink(missing_ok=True)
+                en_path.unlink(missing_ok=True)
+                continue
+            german_heading = next((e.get("heading") for e in entries if e.get("heading")), f"Kapitel {cid + 1}")
+            english_heading = next((e.get("chapter_name") for e in entries if e.get("chapter_name")), "") or f"Chapter {cid + 1}"
+            de_parts = [german_heading, ""]
+            en_parts = [f"Chapter {cid + 1}: {english_heading}" if not english_heading.lower().startswith(("chapter", "kapitel")) else english_heading, ""]
+            for entry in entries:
+                for item in entry.get("items") or []:
+                    text = (item.get("text") or "").strip()
+                    if text:
+                        de_parts.append(text)
+                        de_parts.append("")
+                for paragraph in entry.get("source_paragraphs") or []:
+                    paragraph = (paragraph or "").strip()
+                    if paragraph:
+                        en_parts.append(paragraph)
+                        en_parts.append("")
+            de_dir.mkdir(parents=True, exist_ok=True)
+            en_dir.mkdir(parents=True, exist_ok=True)
+            de_path.write_text("\n".join(de_parts).strip() + "\n", encoding="utf-8")
+            en_path.write_text("\n".join(en_parts).strip() + "\n", encoding="utf-8")
+
     def persist(self, meta: Dict[str, Any], book_title: str = "") -> None:
         self.bilingual_path.write_text(self.bilingual_text(), encoding="utf-8")
         self.german_path.write_text(self.german_text(), encoding="utf-8")
@@ -736,6 +969,10 @@ class AuthorialWriter:
         self.report_path.write_text(
             json.dumps(self.as_report(meta), ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        try:
+            self.write_chapter_files()
+        except Exception:
+            pass  # chapter files must never break the translation run
 
     @staticmethod
     def load_report(path: Path) -> Optional[Dict[str, Any]]:
@@ -743,6 +980,19 @@ class AuthorialWriter:
             return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return None
+
+
+def is_echo_of_text(detail: str, text: str) -> bool:
+    """A 'note' that is really the paragraph text itself (a chain-of-thought
+    echo). Long paragraph-like notes already trip at moderate similarity;
+    short change-notes stay."""
+    text = (text or "").strip()
+    detail = (detail or "").strip()
+    if not text or not detail:
+        return False
+    if len(detail) < 160:
+        return similar_ratio(detail, text) > 0.9
+    return similar_ratio(detail, text) > 0.72
 
 
 def _review_note(
@@ -759,7 +1009,7 @@ def _review_note(
         return
     if kind == "annotation" and _is_junk_note(str(detail)):
         return
-    if echo_against and similar_ratio(str(detail), str(echo_against)) > 0.88:
+    if echo_against and is_echo_of_text(str(detail), str(echo_against)):
         return  # the model echoed the paragraph text itself as a "note"
     normalized = _norm_note(detail)
     for row in entry.get("review") or []:
@@ -815,6 +1065,8 @@ async def run_authorial_translation(
     outdir: Path,
     book: Dict[str, Any],
     resume: bool,
+    structured: bool = True,
+    check_mode: str = CHECK_MODE_ESSENTIAL,
     emit: Callable[[Dict[str, Any]], Awaitable[None]],
     should_stop: Callable[[], bool],
 ) -> Dict[str, Any]:
@@ -847,6 +1099,8 @@ async def run_authorial_translation(
     meta: Dict[str, Any] = {
         "mode": "authorial",
         "language": language,
+        "structured": structured,
+        "check_mode": check_mode if check_mode in CHECK_MODES else CHECK_MODE_ESSENTIAL,
         "draft": {"name": draft_name, "model": draft_profile.get("model")},
         "refiner": {"name": refiner_name, "model": refiner_profile.get("model")},
         "checker": {"name": checker_name, "model": (checker_profile or {}).get("model")}
@@ -877,16 +1131,43 @@ async def run_authorial_translation(
     if resume:
         saved = AuthorialWriter.load_report(writer.report_path)
         reuse = 0
-        if saved and int(saved.get("batches_total") or 0) == len(batches):
-            for entry in saved.get("batches") or []:
-                index = int(entry.get("index", -1))
-                if (
-                    0 <= index < len(batches)
-                    and entry.get("source_hash") == batches[index]["source_hash"]
-                ):
-                    entry["source_block"] = writer.source_for(batches[index])
-                    writer.set_entry(index, entry)
+        if saved:
+            # hash-based reuse: finished batches survive across DIFFERENT
+            # chapter selections / batch sizes — a total-count gate would
+            # throw previously translated chapters away (that cost us chapter
+            # 1 once already). Non-matching slots become draft placeholders.
+            by_index: Dict[int, Dict[str, Any]] = {}
+            for saved_entry in saved.get("batches") or []:
+                index_raw = saved_entry.get("index")
+                if isinstance(index_raw, int) and 0 <= index_raw < len(batches):
+                    by_index[index_raw] = saved_entry
+            for index, batch in enumerate(batches):
+                saved_entry = by_index.get(index)
+                if saved_entry is not None and saved_entry.get("source_hash") == batch["source_hash"]:
+                    saved_entry["source_block"] = writer.source_for(batch)
+                    writer.set_entry(index, saved_entry)
                     reuse += 1
+                else:
+                    writer.set_entry(
+                        index,
+                        {
+                            "index": index,
+                            "chapter_id": batch["chapter_id"],
+                            "chapter_name": batch["chapter_name"],
+                            "source_hash": batch["source_hash"],
+                            "source_block": writer.source_for(batch),
+                            "source_paragraphs": batch["paragraphs"],
+                            "stage": "draft",
+                            "draft_error": None,
+                            "draft_text": "",
+                            "draft_notes": [],
+                            "heading": None,
+                            "german_segments": [],
+                            "items": [],
+                            "review": [],
+                            "errors": [],
+                        },
+                    )
         if reuse:
             await emit(
                 {
@@ -916,22 +1197,21 @@ async def run_authorial_translation(
             # ---- Stufe 1: Entwurf -------------------------------------------
             if stage not in ("drafted", "refined", "done"):
                 try:
-                    response = await draft_client.chat(
-                        draft_messages(
-                            source_block, language, book, writer.last_paragraph(), style_probe
+                    text, notes, usage_struct = await signal_call(
+                        emit,
+                        draft_name,
+                        f"Kapitel {batch['chapter_id'] + 1} · Block {index + 1}/{len(batches)}",
+                        lambda: call_structured(
+                            draft_client,
+                            draft_messages(
+                                source_block, language, book, writer.last_paragraph(), style_probe
+                            ),
+                            draft_temperature,
+                            structured=structured,
                         ),
-                        temperature=draft_temperature,
                     )
-                    raw = (response.content or "").strip()
-                    _accumulate(draft_name, _role_usage(response.usage))
+                    _accumulate(draft_name, _role_usage(usage_struct))
                     await _unload(draft_profile)
-                    if not raw:
-                        raise LlmError("empty draft")
-                    text, notes, _marker = clean_model_prose(raw)
-                    if not text.strip():
-                        raise LlmError("draft produced no prose before ANMERKUNGEN")
-                    if is_placeholder_prose(text):
-                        raise LlmError("draft answered with a placeholder instead of prose")
                 except Exception as exc:
                     entry = {
                         "index": index,
@@ -1050,22 +1330,21 @@ async def run_authorial_translation(
                     }
                     for round_no in range(1, refine_rounds + 1):
                         try:
-                            response = await refiner_client.chat(
-                                refine_messages(
-                                    para_source, previous, item["text"], language, book
+                            refined, note_lines, usage_struct = await signal_call(
+                                emit,
+                                refiner_name,
+                                f"Kapitel {batch['chapter_id'] + 1} · ¶{p_index + 1}/{len(pairs)} · Runde {round_no}/{refine_rounds}",
+                                lambda: call_structured(
+                                    refiner_client,
+                                    refine_messages(
+                                        para_source, previous, item["text"], language, book
+                                    ),
+                                    REFINE_TEMPERATURE,
+                                    structured=structured,
                                 ),
-                                temperature=REFINE_TEMPERATURE,
                             )
-                            raw = (response.content or "").strip()
-                            _accumulate(refiner_name, _role_usage(response.usage))
+                            _accumulate(refiner_name, _role_usage(usage_struct))
                             await _unload(refiner_profile)
-                            if not raw:
-                                raise LlmError("empty refinement")
-                            refined, note_lines, _marker = clean_model_prose(raw)
-                            if not refined.strip():
-                                raise LlmError("refinement produced no prose")
-                            if is_placeholder_prose(refined):
-                                raise LlmError("refinement answered with a placeholder instead of prose")
                         except Exception as exc:
                             await _unload(refiner_profile)
                             item["error"] = str(exc)
@@ -1090,6 +1369,18 @@ async def run_authorial_translation(
                     items.append(item)
                     entry["items"] = items
                     writer.persist(meta, book.get("title") or "")
+                    await emit(
+                        {
+                            "type": "translate_progress",
+                            "batch_index": index + 1,
+                            "batches_total": len(batches),
+                            "chapter_id": batch["chapter_id"],
+                            "paragraph": p_index + 1,
+                            "paragraphs_total": len(pairs),
+                            "rounds": item["rounds"],
+                            "stopped_early": bool(item["stopped_early"]),
+                        }
+                    )
                 entry["stage"] = "refined"
                 writer.persist(meta, book.get("title") or "")
                 await emit(
@@ -1103,13 +1394,22 @@ async def run_authorial_translation(
                     }
                 )
 
-            # ---- Stufe 3: Prüfen (nur flaggen) ------------------------------
+            # ---- Stufe 3: Prüfen -------------------------------------------
+            # essential: keine Scores, kein Checker-Call — Flags nur für den
+            # Katastrophenfall (deutscher Text fehlt). strict: das alte Scoring.
             if entry["stage"] == "refined":
                 for item in entry.get("items") or []:
                     en_text = item.get("source") or ""
                     de_text = item.get("text") or ""
                     ratio = char_ratio(de_text, en_text)
                     item["length_ratio"] = ratio
+                    if check_mode == CHECK_MODE_ESSENTIAL:
+                        if not de_text.strip() or is_placeholder_prose(de_text):
+                            _review_note(
+                                entry, "fidelity", item.get("index"),
+                                "deutscher Text fehlt (nicht übersetzt oder Platzhalter)",
+                            )
+                        continue
                     flag = length_flag(ratio, ratio_min, ratio_max)
                     if flag:
                         _review_note(entry, "length", item.get("index"), flag)
@@ -1119,9 +1419,14 @@ async def run_authorial_translation(
                             writer.persist({**meta, "interrupted": True}, book.get("title") or "")
                             raise TranslationStopped()
                         try:
-                            response = await checker_client.chat(
-                                check_messages(en_text, de_text, language),
-                                temperature=CHECK_TEMPERATURE,
+                            response = await signal_call(
+                                emit,
+                                checker_name or "checker",
+                                f"Kapitel {batch['chapter_id'] + 1} · ¶{(item.get('index') or 0) + 1}/{len(entry.get('items') or [])} · Fidelity-Check",
+                                lambda: checker_client.chat(
+                                    check_messages(en_text, de_text, language),
+                                    temperature=CHECK_TEMPERATURE,
+                                ),
                             )
                             verdict = parse_fidelity(response.content or "")
                             _accumulate(checker_name or "checker", _role_usage(response.usage))

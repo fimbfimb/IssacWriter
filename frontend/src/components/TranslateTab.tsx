@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api";
 import type { Book, ChapterRecord, Profile, TranslationStatus } from "../types";
 import ReviewCard from "./ReviewCard";
+import ActivityChip from "./ActivityChip";
 
 const JUDGE_WARNING = "Use several candidate models and a separate judge model: every block is translated by each candidate, the judge picks the winning translation. Local Ollama candidates are unloaded right after each call (keep_alive: 0) so no model clogs VRAM.";
 
@@ -11,16 +12,17 @@ function formatTranslationEvent(event: any): { time: string; html: string } {
   const time = event.sent_at ? new Date(event.sent_at * 1000).toLocaleTimeString() : "";
   const safe = (text: string) => String(text).replace(/[<>&]/g, "");
   if (event.type === "translation_started") {
+    const sourceNote = event.source === "refined" ? ` · Quelle: <b>refined</b>` : "";
     if (event.mode === "authorial")
       return {
         time,
-        html: `Translation started — <b>${safe(event.language)}</b> · mode <b>authorial</b> · draft <b>${safe(event.draft ?? "")}</b> · refiner <b>${safe(event.refiner ?? "")}</b> · checker <b>${safe(event.checker ?? "— (length watchdog only)")}</b>`,
+        html: `Translation started — <b>${safe(event.language)}</b> · mode <b>authorial</b> · draft <b>${safe(event.draft ?? "")}</b> · refiner <b>${safe(event.refiner ?? "")}</b> · checker <b>${safe(event.checker ?? "— (length watchdog only)")}</b>${sourceNote}`,
       };
     return {
       time,
       html: `Translation started — <b>${safe(event.language)}</b> · mode <b>${safe(event.mode ?? "tool")}</b>${
         event.candidates?.length ? ` · candidates: ${event.candidates.map((c: string) => safe(c)).join(", ")} · judge: ${safe(event.judge ?? "—")}` : ` · <b>${safe(event.profile_name ?? "")}</b> (${safe(event.model ?? "")})`
-      }${event.test_num > 0 ? ` · test mode: first ${event.test_num} lines` : ""}`,
+      }${event.test_num > 0 ? ` · test mode: first ${event.test_num} lines` : ""}${sourceNote}`,
     };
   }
   if (event.type === "translation_batch") {
@@ -42,6 +44,18 @@ function formatTranslationEvent(event: any): { time: string; html: string } {
       html: `<span class="ev-ok">✔ block ${event.batch_index}/${event.batches_total} (chapter ${event.chapter_id ?? "?"})</span> — winner <b>${safe(event.winner ?? "")}</b>${event.reason ? `: ${safe(event.reason)}` : ""}`,
     };
   }
+  if (event.type === "translate_progress")
+    return {
+      time,
+      html: `<span class="ev-ok">¶ ${event.paragraph}/${event.paragraphs_total} verfeinert</span> — ${event.rounds} Runde(n)${event.stopped_early ? " · Frühstopp" : ""}`,
+    };
+  if (event.type === "llm_call") {
+    if (event.phase === "start")
+      return { time, html: `⌛ <b>${safe(event.role ?? "")}</b> arbeitet… ${safe(event.detail ?? "")}` };
+    if (event.phase === "done")
+      return { time, html: `<span class="ev-ok">✔ ${safe(event.role ?? "")}</span> fertig in ${safe(String(event.elapsed_s ?? "?"))}s — ${safe(event.detail ?? "")}` };
+    return { time, html: `<span class="ev-fail">✘ ${safe(event.role ?? "")} Fehler nach ${safe(String(event.elapsed_s ?? "?"))}s</span> — ${safe(event.detail ?? "")}` };
+  }
   if (event.type === "translation_output") return { time, html: safe((event.lines ?? []).slice(-2).join(" \u00b7 ")) };
   if (event.type === "translation_done") {
     if (event.status === "done")
@@ -62,7 +76,7 @@ function formatTranslationEvent(event: any): { time: string; html: string } {
   return { time, html: safe(event.type ?? "") };
 }
 
-const TRANSLATION_EVENTS = ["translation_started", "translation_batch", "translation_output", "translation_done", "translation_error"];
+const TRANSLATION_EVENTS = ["translation_started", "translation_batch", "translate_progress", "translation_output", "translation_done", "translation_error", "llm_call"];
 
 export default function TranslateTab({
   book,
@@ -90,8 +104,10 @@ export default function TranslateTab({
   const [ratioMin, setRatioMin] = useState<number>(saved.ratio_min ?? 0.85);
   const [ratioMax, setRatioMax] = useState<number>(saved.ratio_max ?? 1.45);
   const [batchWords, setBatchWords] = useState<number>(saved.batch_words ?? 0);
+  const [checkMode, setCheckMode] = useState<string>(saved.check_mode ?? "essential");
   const [styleProbe, setStyleProbe] = useState<string>(saved.style_probe ?? "");
   const [unloadAfterCall, setUnloadAfterCall] = useState<boolean>(saved.unload_after_call ?? true);
+  const [useRefined, setUseRefined] = useState<boolean>(saved.use_refined ?? false);
   const [targetLanguage, setTargetLanguage] = useState(saved.target_language ?? "German");
   const [chapters, setChapters] = useState<ChapterRecord[]>([]);
   const [chapterSelection, setChapterSelection] = useState<Set<number> | null>(null);
@@ -177,11 +193,13 @@ export default function TranslateTab({
       refiner_profile_id: refinerId,
       checker_profile_id: checkerId,
       unload_after_call: unloadAfterCall,
+      use_refined: useRefined,
       single_translate: singleTranslate,
       test_mode: testMode,
       test_num: testNum,
       batch_size: batchSize,
       batch_words: batchWords,
+      check_mode: checkMode,
       draft_temperature: draftTemp,
       refine_rounds: refineRounds,
       similarity_stop: similarityStop,
@@ -189,7 +207,7 @@ export default function TranslateTab({
       ratio_max: ratioMax,
       style_probe: styleProbe,
     }),
-    [mode, targetLanguage, profileId, candidates, judgeId, draftId, refinerId, checkerId, unloadAfterCall, singleTranslate, testMode, testNum, batchSize, batchWords, refineRounds, similarityStop, ratioMin, ratioMax, styleProbe, draftTemp],
+    [mode, targetLanguage, profileId, candidates, judgeId, draftId, refinerId, checkerId, unloadAfterCall, useRefined, singleTranslate, testMode, testNum, batchSize, batchWords, checkMode, refineRounds, similarityStop, ratioMin, ratioMax, styleProbe, draftTemp],
   );
 
   useEffect(() => {
@@ -268,7 +286,7 @@ export default function TranslateTab({
     return fromProgress;
   }, [chapterProgress]);
 
-  const start = async (resumeRun: boolean) => {
+  const start = async (resumeRun: boolean, overrides: { chapterIds?: number[] | null } = {}) => {
     if (!(book.chapters_written ?? 0)) {
       showToast("Nothing written yet — write at least one chapter first");
       return;
@@ -287,15 +305,21 @@ export default function TranslateTab({
     }
     try {
       setResume(resumeRun);
+      const chapterOverride = "chapterIds" in overrides ? overrides.chapterIds : undefined;
+      const chapterSource =
+        chapterOverride === undefined
+          ? (chapterSelection !== null ? Array.from(chapterSelection) : null)
+          : chapterOverride;
       const payload: any = {
         target_language: targetLanguage,
         mode,
         profile_id: profileId,
-        chapter_ids: chapterSelection !== null ? Array.from(chapterSelection) : null,
+        chapter_ids: chapterSource,
         single_translate: singleTranslate,
         test_num: testMode ? testNum : 0,
         batch_size: batchSize,
         resume: resumeRun,
+        use_refined: useRefined,
       };
       if (mode === "ensemble") {
         payload.candidate_profile_ids = Array.from(candidates);
@@ -311,6 +335,7 @@ export default function TranslateTab({
         payload.ratio_min = ratioMin;
         payload.ratio_max = ratioMax;
         payload.batch_words = batchWords || 0;
+        payload.check_mode = checkMode === "strict" ? "strict" : "essential";
         payload.draft_temperature = draftTemp;
         payload.style_probe = styleProbe;
         payload.candidate_profile_ids = [];
@@ -331,6 +356,25 @@ export default function TranslateTab({
       await api.translateStop(book.id);
       showToast("Stopping — the tool saves its partial output");
       refreshStatus();
+    } catch (err: any) {
+      showToast(err.message);
+    }
+  };
+
+  // wipes one chapter's translated batches so a resume run re-does exactly
+  // this chapter with the CURRENT system (e.g. the structured tool protocol) —
+  // then starts the whole book WITHOUT any chapter filter (a stray selection
+  // must not silently exclude the chapter we just reset)
+  const resetChapter = async (chapterId: number) => {
+    if (busy) return;
+    if (!window.confirm("Kapitel-Übersetzung zurücksetzen und mit dem aktuellen System neu übersetzen? Die bisherigen Entscheidungen/Notizen dieses Kapitels gehen verloren — der Rest des Buches bleibt.")) {
+      return;
+    }
+    try {
+      const result = await api.translateResetChapter(book.id, chapterId);
+      showToast(`Kapitel zurückgesetzt (${result.reset_batches} Blöcke) — übersetze Buch weiter`);
+      await refreshBook();
+      await start(true, { chapterIds: null });
     } catch (err: any) {
       showToast(err.message);
     }
@@ -407,6 +451,22 @@ tools\\bbm-venv\\Scripts\\pip install -e tools/bilingual_book_maker`}
             <label>Target language</label>
             <input value={targetLanguage} onChange={(e) => setTargetLanguage(e.target.value)} disabled={busy} />
           </div>
+          <div className="form-col" style={{ minWidth: 250 }}>
+            <label>
+              <input
+                type="checkbox"
+                checked={useRefined}
+                onChange={(e) => setUseRefined(e.target.checked)}
+                disabled={busy}
+              />{" "}
+              Quelle: verfeinerte Fassung (refined/)
+            </label>
+            <div className="muted" style={{ fontSize: 11.5 }}>
+              Übersetzt die AKTIVEN Refined-Versionen. Kapitel ohne Refined-Fassung fallen aufs
+              Original zurück — das wird im Lauf-Log sichtbar gemeldet. Gibt es nirgends eine
+              Refined-Fassung, startet die Übersetzung gar nicht.
+            </div>
+          </div>
           {mode !== "authorial" ? (
             <div className="form-col" style={{ minWidth: 140 }}>
               <label>{mode === "ensemble" ? "Paragraphs per block" : "Batch size (lines/request)"}</label>
@@ -455,9 +515,31 @@ tools\\bbm-venv\\Scripts\\pip install -e tools/bilingual_book_maker`}
                 ▶ Start translation
               </button>
             )}
-            {!busy && ["stopped", "error"].includes(tState) && (
-              <button className="btn-primary" onClick={() => start(true)}>
+            {!busy && (
+              <button
+                className="btn-primary"
+                onClick={() => start(true)}
+                title="Setzt denlauf fort: fertige Blöcke bleiben, angefangene/unfertige laufen weiter (nach einem Server-Neustart steht der Läufer auf idle — der Resume findet trotzdem die gespeicherten Blöcke)"
+              >
                 ⟳ Resume last run
+              </button>
+            )}
+            {!busy && (
+              <button
+                className="btn-danger"
+                onClick={async () => {
+                  if (!window.confirm("ALLES löschen — komplette Übersetzung (alle Kapitel, alle Reports, alle Notizen) für die Sprache? Danach mit ▶ Start von Null neu.")) return;
+                  try {
+                    const r = await api.translateResetAll(book.id);
+                    showToast(`Gelöscht: ${r.removed.join(", ") || "nichts vorhanden"}`);
+                    refreshStatus();
+                    refreshBook();
+                  } catch (err: any) {
+                    showToast(err.message);
+                  }
+                }}
+              >
+                🧹 Alles löschen
               </button>
             )}
             {busy && (
@@ -647,6 +729,19 @@ tools\\bbm-venv\\Scripts\\pip install -e tools/bilingual_book_maker`}
               </div>
             </div>
             <div style={{ marginTop: 10 }}>
+              <div className="form-col" style={{ minWidth: 280 }}>
+                <label>Review checks</label>
+                <select value={checkMode} onChange={(e) => setCheckMode(e.target.value)} disabled={busy}>
+                  <option value="essential">Nur echte Fehler (Standard — keine Scores)</option>
+                  <option value="strict">Streng: Längen-/Treue-Prüfung flaggen</option>
+                </select>
+                <div className="muted" style={{ fontSize: 11.5 }}>
+                  „Nur echte Fehler” flaggt ausschließlich kaputte Ausgaben (z. B. fehlender Text). Der
+                  Treue-Checker wird dann nicht mehr gerufen — Läufe sind schneller.
+                </div>
+              </div>
+            </div>
+            <div style={{ marginTop: 10 }}>
               <div className="form-col" style={{ maxWidth: 640 }}>
                 <label>Style probe (target tone as an example, optional — form is free, content is not copied)</label>
                 <textarea
@@ -668,8 +763,24 @@ tools\\bbm-venv\\Scripts\\pip install -e tools/bilingual_book_maker`}
               {statusValues.profile_name} · {statusValues.model}
             </span>
           )}
-          {statusValues?.error && <span style={{ color: "var(--danger)", fontSize: 12.5 }}>{statusValues.error}</span>}
-        </div>
+          {statusValues?.source_mode === "refined" && (
+            <span className="chip" title="Dieser Lauf liest die aktiven Refined-Versionen der abgeschlossenen Kapitel">
+              Quelle: refined ({(statusValues.refined_used ?? []).length})
+            </span>
+          )}
+          {(statusValues?.refined_fallback?.length ?? 0) > 0 && (
+            <span className="chip" style={{ color: "var(--warn)", borderColor: "var(--warn)" }} title="Kapitel ohne Refined-Fassung — diese werden vom Original übersetzt">
+              Original-Fallback: {(statusValues?.refined_fallback ?? []).slice(0, 6).map((c: number) => c + 1).join(", ")}
+              {(statusValues?.refined_fallback ?? []).length > 6 ? ", …" : ""}
+            </span>
+          )}
+        {statusValues?.error && <span style={{ color: "var(--danger)", fontSize: 12.5 }}>{statusValues.error}</span>}
+        <ActivityChip
+          activity={statusValues?.activity}
+          lastActivity={statusValues?.last_activity}
+          running={busy}
+        />
+      </div>
       </div>
 
       {(chapterProgress?.chapters?.length ?? 0) > 0 && (
@@ -725,6 +836,14 @@ tools\\bbm-venv\\Scripts\\pip install -e tools/bilingual_book_maker`}
                 <span style={{ fontSize: 11.5, width: 48, textAlign: "right", color: chapter.review_flags ? "var(--warn)" : "var(--muted)" }}>
                   {chapter.review_flags}
                 </span>
+                <button
+                  title="Kapitel-Übersetzung zurücksetzen und mit dem aktuellen System (strukturierter Output) neu übersetzen — nur dieses Kapitel, der Rest bleibt"
+                  disabled={busy}
+                  onClick={() => resetChapter(chapter.chapter_id)}
+                  style={{ fontSize: 11.5, padding: "2px 8px" }}
+                >
+                  ⟳ neu
+                </button>
               </div>
             );
           })}
@@ -753,7 +872,12 @@ tools\\bbm-venv\\Scripts\\pip install -e tools/bilingual_book_maker`}
 
       <div className="card">
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <strong>Chapters to translate</strong>
+          <strong>
+            Chapters to translate{" "}
+            <span className="chip" style={{ color: chapterSelection ? "var(--warn)" : "var(--good)" }}>
+              {chapterSelection ? `${chapterSelection.size} von ${chapters.length || "?"} gewählt` : "alle"}
+            </span>
+          </strong>
           <div style={{ display: "flex", gap: 8 }}>
             <button onClick={() => setChapterSelection(null)}>All</button>
             <button onClick={() => setChapterSelection(new Set())}>None</button>

@@ -55,6 +55,13 @@ as the core engine, wrapped in a local GUI for planning, monitoring, interventio
     annotations never auto-rewrite; they land in `review_list.md` for a human decision. Bilingual
     output, German-only output (`book_german.txt`), stage-level checkpoints and resume as in the
     other modes. See `uebersetzungssystem.md` for the evidence behind the pipeline.
+- **Refine** (tab between Write and Translate): the same draft → refine → check pipeline applied to
+  the **original manuscript itself** — weak English prose is rewritten into stronger prose of the
+  same language. The original chapters under `chapters/` are never touched: every finished chapter
+  is committed as a NEW version file under `refined/chNNNN/vNNNN.json` (re-runs append versions,
+  nothing is overwritten), `index.json` tracks the active version, and `refined/book_refined.txt` /
+  `manuscript_refined.md` are assembled from the active versions. Batch-resume keeps finished
+  stages; a stopped run resumes without repeating finished blocks.
 
 ## Run (Windows)
 

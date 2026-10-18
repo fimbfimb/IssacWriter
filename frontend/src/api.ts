@@ -144,6 +144,23 @@ export const api = {
       `/api/books/${id}/translate/review/retranslate`,
       { method: "POST", body: JSON.stringify({ batch_index: batchIndex, unload_after_call: unloadAfterCall }) },
     ),
+  translateResetChapter: (id: string, chapterId: number) =>
+    request<{ open_flags: number; total_flags: number; reset_batches: number; review: ReviewResponse }>(
+      `/api/books/${id}/translate/review/reset-chapter`,
+      { method: "POST", body: JSON.stringify({ chapter_id: chapterId }) },
+    ),
+  translateResetAll: (id: string) =>
+    request<{ removed: string[] }>(`/api/books/${id}/translate/reset-all`, { method: "POST" }),
+  translateAnnotationsRead: (id: string, ids: string[]) =>
+    request<{ read_count: number; review: ReviewResponse }>(
+      `/api/books/${id}/translate/review/annotations/read`,
+      { method: "POST", body: JSON.stringify({ ids }) },
+    ),
+  translateFixParagraph: (id: string, data: { batch_index: number; paragraph: number; text: string }) =>
+    request<{ open_flags: number; total_flags: number; review: ReviewResponse }>(
+      `/api/books/${id}/translate/review/fix-paragraph`,
+      { method: "POST", body: JSON.stringify(data) },
+    ),
 
   getLayout: (id: string) => request<LayoutResponse>(`/api/books/${id}/layout`),
   putLayout: (id: string, data: Record<string, any>) =>
@@ -219,6 +236,7 @@ export const api = {
       test_num?: number;
       batch_size?: number;
       resume?: boolean;
+      use_refined?: boolean;
       candidate_profile_ids?: string[];
       judge_profile_id?: string | null;
       unload_after_call?: boolean;
@@ -269,6 +287,166 @@ export const api = {
     request<{ path: string; content: string }>(
       `/api/books/${id}/translate/file?path=${encodeURIComponent(path)}`,
     ),
+
+  refineStart: (
+    id: string,
+    data: {
+      language?: string;
+      draft_profile_id?: string;
+      refiner_profile_id?: string;
+      checker_profile_id?: string | null;
+      unload_after_call?: boolean;
+      chapter_ids?: number[] | null;
+      resume?: boolean;
+      batch_words?: number;
+      refine_rounds?: number;
+      similarity_stop?: number;
+      ratio_min?: number;
+      ratio_max?: number;
+      draft_temperature?: number;
+      style_probe?: string;
+      structured?: boolean;
+      check_mode?: string;
+    },
+  ) =>
+    request<{ status: any }>(`/api/books/${id}/refine`, {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+  refineStatus: (id: string) =>
+    request<{ status: Record<string, any> }>(`/api/books/${id}/refine/status`),
+  refineProgress: (id: string) =>
+    request<{
+      mode: string | null;
+      run_status: string;
+      batches_total: number | null;
+      chapters: {
+        chapter_id: number;
+        chapter_name: string;
+        words_total: number;
+        refined_words: number;
+        batches_total: number;
+        batches_done: number;
+        paragraphs: number;
+        review_flags: number;
+        started: boolean;
+        done: boolean;
+        versions: number[];
+        active_version: number | null;
+      }[];
+    }>(`/api/books/${id}/refine/progress`),
+  refineStop: (id: string) =>
+    request<{ status: any }>(`/api/books/${id}/refine/stop`, { method: "POST" }),
+  refineOutputs: (id: string) =>
+    request<{ outputs: { path: string; size: number; modified: number }[] }>(
+      `/api/books/${id}/refine/outputs`,
+    ),
+  refineFile: (id: string, path: string) =>
+    request<{ path: string; content: string }>(
+      `/api/books/${id}/refine/file?path=${encodeURIComponent(path)}`,
+    ),
+  refineVersions: (id: string) =>
+    request<{
+      chapters: {
+        chapter_id: number;
+        chapter_name: string;
+        original_words: number;
+        active_version: number | null;
+        versions: {
+          version: number;
+          created: string | null;
+          words: number;
+          review_flags: number;
+          models: Record<string, string | null>;
+          run_started_at: number | null;
+        }[];
+      }[];
+    }>(`/api/books/${id}/refine/versions`),
+  refineVersion: (id: string, chapterId: number, version?: number) =>
+    request<Record<string, any>>(
+      `/api/books/${id}/refine/version?chapter_id=${chapterId}${version ? `&version=${version}` : ""}`,
+    ),
+  refineSelectVersion: (id: string, chapterId: number, version: number) =>
+    request<{ chapter_id: number; version: number; status: any }>(
+      `/api/books/${id}/refine/versions/select`,
+      { method: "POST", body: JSON.stringify({ chapter_id: chapterId, version }) },
+    ),
+  refineResetAll: (id: string) =>
+    request<{ removed: string[] }>(`/api/books/${id}/refine/reset-all`, { method: "POST" }),
+
+  outlineRefineStart: (
+    id: string,
+    data: {
+      profile_id: string;
+      chapter_ids?: number[] | null;
+      resume?: boolean;
+      refine_rounds?: number;
+      similarity_stop?: number;
+      context_prev?: number;
+      language?: string;
+      unload_after_call?: boolean;
+      structured?: boolean;
+      style_probe?: string;
+    },
+  ) =>
+    request<{ status: any }>(`/api/books/${id}/outline-refine`, {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+  outlineRefineStatus: (id: string) =>
+    request<{ status: Record<string, any> }>(`/api/books/${id}/outline-refine/status`),
+  outlineRefineStop: (id: string) =>
+    request<{ status: any }>(`/api/books/${id}/outline-refine/stop`, { method: "POST" }),
+  outlineRefineProgress: (id: string) =>
+    request<{
+      run_status: string;
+      batches_total: number | null;
+      chapters: {
+        chapter_id: number;
+        chapter_name: string;
+        word_count: number;
+        brief_words: number;
+        started: boolean;
+        done: boolean;
+        review_notes: number;
+        versions: number[];
+        active_version: number | null;
+      }[];
+    }>(`/api/books/${id}/outline-refine/progress`),
+  outlineRefineOutputs: (id: string) =>
+    request<{ outputs: { path: string; size: number; modified: number }[] }>(
+      `/api/books/${id}/outline-refine/outputs`,
+    ),
+  outlineRefineFile: (id: string, path: string) =>
+    request<{ path: string; content: string }>(
+      `/api/books/${id}/outline-refine/file?path=${encodeURIComponent(path)}`,
+    ),
+  outlineRefineVersions: (id: string) =>
+    request<{
+      chapters: {
+        chapter_id: number;
+        chapter_name: string;
+        original_words: number;
+        active_version: number | null;
+        versions: {
+          version: number;
+          created: string | null;
+          words: number;
+          models: Record<string, string | null>;
+        }[];
+      }[];
+    }>(`/api/books/${id}/outline-refine/versions`),
+  outlineRefineVersion: (id: string, chapterId: number, version?: number) =>
+    request<Record<string, any>>(
+      `/api/books/${id}/outline-refine/version?chapter_id=${chapterId}${version ? `&version=${version}` : ""}`,
+    ),
+  outlineRefineSelectVersion: (id: string, chapterId: number, version: number) =>
+    request<{ chapter_id: number; version: number; status: any }>(
+      `/api/books/${id}/outline-refine/versions/select`,
+      { method: "POST", body: JSON.stringify({ chapter_id: chapterId, version }) },
+    ),
+  outlineRefineResetAll: (id: string) =>
+    request<{ removed: string[] }>(`/api/books/${id}/outline-refine/reset-all`, { method: "POST" }),
 };
 
 export function openEventStream(bookId: string, onEvent: (event: any) => void): () => void {

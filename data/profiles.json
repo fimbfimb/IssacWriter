@@ -79,5 +79,31 @@
     "thinking": "default",
     "extra_params": {},
     "id": "83a12e2b"
+  },
+  "93e4b72f": {
+    "name": "OllamaMISTRAL_Large",
+    "base_url": "http://localhost:11434/v1",
+    "api_key": "",
+    "model": "mistral-large-3:675b-cloud",
+    "temperature": 0.7,
+    "max_output_tokens": 32768,
+    "price_in_per_m": 0.5,
+    "price_out_per_m": 1.5,
+    "thinking": "medium",
+    "extra_params": {},
+    "id": "93e4b72f"
+  },
+  "fe39df67": {
+    "name": "OllamaMistral4Large",
+    "base_url": "http://localhost:11434/v1",
+    "api_key": "",
+    "model": "mistral-large-4:cloud",
+    "temperature": 0.7,
+    "max_output_tokens": 32768,
+    "price_in_per_m": 0.68,
+    "price_out_per_m": 2.09,
+    "thinking": "default",
+    "extra_params": {},
+    "id": "fe39df67"
   }
 }

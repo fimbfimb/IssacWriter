@@ -35,6 +35,10 @@ from ..llm.profiles import ProfileStore
 from ..llm.provider import extract_json
 from ..nstagent.prompts import CHAPTER_ANCHORS, MAX_CORRECT_PER_CHAPTER, MAX_READ, MAX_SEARCH, MAX_TURNS_PER_CHAPTER, SEARCH_MAX_HITS
 from ..nstagent.runner import RunnerRegistry
+from ..refine import engine as refine_engine
+from ..refine.runner import RefineRegistry
+from ..refine import outline_engine
+from ..refine.outline_runner import OutlineRefineRegistry
 from ..sequel import create_sequel_book, prepare_sequel
 from ..stats.mentions import build_stats, export_markdown, export_txt
 from ..store.codex import merge_extracted
@@ -42,14 +46,16 @@ from ..store.project import BookStore
 from ..translation.authorial import AuthorialWriter
 from ..translation.review import (
     ReviewError,
+    add_read_marks as review_add_read_marks,
     apply_decision,
     build_review_response,
     collect_rows,
+    current_report as review_current_report,
+    fix_paragraph as review_fix_paragraph,
     previous_german_text,
     retranslate_batch,
 )
 from ..translation.review import _restore_writer as restore_writer
-from ..translation.review import report_files as review_report_files
 from ..translation.runner import TranslationRegistry, _slugify as slugify_language
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -110,6 +116,9 @@ class PatchBook(BaseModel):
     target_words: Optional[int] = None
     run_settings: Optional[Dict[str, Any]] = None
     translation_settings: Optional[Dict[str, Any]] = None
+    refine_settings: Optional[Dict[str, Any]] = None
+    outline_refine_settings: Optional[Dict[str, Any]] = None
+    refined_descriptions_source: Optional[bool] = None
     planner_profile_id: Optional[str] = None
     writer_profile_id: Optional[str] = None
 
@@ -138,6 +147,7 @@ class TranslateIn(BaseModel):
     test_num: int = 0
     batch_size: int = 10
     resume: bool = False
+    use_refined: bool = False
     # authorial mode
     draft_profile_id: Optional[str] = None
     refiner_profile_id: Optional[str] = None
@@ -149,6 +159,50 @@ class TranslateIn(BaseModel):
     ratio_min: float = 0.85
     ratio_max: float = 1.45
     batch_words: int = 0
+    structured: bool = True
+    check_mode: str = "essential"
+
+
+class RefineIn(BaseModel):
+    language: str = "English"
+    draft_profile_id: Optional[str] = None
+    refiner_profile_id: Optional[str] = None
+    checker_profile_id: Optional[str] = None
+    unload_after_call: bool = True
+    chapter_ids: Optional[List[int]] = None
+    resume: bool = False
+    batch_words: int = 0
+    refine_rounds: int = 2
+    similarity_stop: float = 0.97
+    ratio_min: float = 0.75
+    ratio_max: float = 1.5
+    draft_temperature: float = 0.7
+    style_probe: str = ""
+    structured: bool = True
+    check_mode: str = "essential"
+
+
+class RefineSelectIn(BaseModel):
+    chapter_id: int
+    version: int
+
+
+class OutlineRefineIn(BaseModel):
+    profile_id: str
+    chapter_ids: Optional[List[int]] = None
+    resume: bool = False
+    refine_rounds: int = 1
+    similarity_stop: float = 0.95
+    context_prev: int = 3
+    language: str = "English"
+    unload_after_call: bool = True
+    structured: bool = True
+    style_probe: str = ""
+
+
+class OutlineRefineSelectIn(BaseModel):
+    chapter_id: int
+    version: int
 
 
 class SequelPrepareIn(BaseModel):
@@ -190,6 +244,8 @@ def create_app() -> FastAPI:
     profiles = ProfileStore(DATA_ROOT / "profiles.json")
     runners = RunnerRegistry(store)
     translations = TranslationRegistry(store)
+    refines = RefineRegistry(store)
+    outline_refines = OutlineRefineRegistry(store)
 
     def get_book_or_404(book_id: str) -> Dict[str, Any]:
         try:
@@ -283,6 +339,7 @@ def create_app() -> FastAPI:
         book["chapters_written"] = chapters
         book["runner"] = runners.status(book_id)
         book["translation"] = translations.get(book_id)._meta()
+        book["refine"] = refines.get(book_id)._meta()
         book["author_notes"] = store.peek_author_notes(book_id)
         return {"book": book}
 
@@ -291,6 +348,9 @@ def create_app() -> FastAPI:
         book = get_book_or_404(book_id)
         data = payload.model_dump(exclude_none=True)
         translation_settings = data.pop("translation_settings", None)
+        refine_settings = data.pop("refine_settings", None)
+        outline_refine_settings = data.pop("outline_refine_settings", None)
+        refined_descriptions_source = data.pop("refined_descriptions_source", None)
         saved = False
         if data:
             runner = runners.get(book_id)
@@ -310,6 +370,17 @@ def create_app() -> FastAPI:
         if translation_settings is not None:
             # translator settings are editable while a translation runs
             book["translation_settings"] = translation_settings
+            saved = True
+        if refine_settings is not None:
+            # refine settings are editable while a refinement runs
+            book["refine_settings"] = refine_settings
+            saved = True
+        if outline_refine_settings is not None:
+            book["outline_refine_settings"] = outline_refine_settings
+            saved = True
+        if refined_descriptions_source is not None:
+            # writer source toggle — takes effect at the next writing run
+            book["refined_descriptions_source"] = bool(refined_descriptions_source)
             saved = True
         if saved:
             store.save_book(book)
@@ -622,6 +693,7 @@ def create_app() -> FastAPI:
             "test_num": payload.test_num,
             "batch_size": payload.batch_size,
             "resume": payload.resume,
+            "use_refined": payload.use_refined,
         }
         if mode == "tool":
             profile = profile_or_404(payload.profile_id or book.get("writer_profile_id"))
@@ -662,6 +734,8 @@ def create_app() -> FastAPI:
             config["ratio_min"] = payload.ratio_min
             config["ratio_max"] = payload.ratio_max
             config["batch_words"] = payload.batch_words
+            config["structured"] = payload.structured
+            config["check_mode"] = payload.check_mode if payload.check_mode in ("essential", "strict") else "essential"
         else:
             raise HTTPException(400, "mode must be 'tool', 'ensemble' or 'authorial'")
         await translations.get(book_id).start(config)
@@ -766,11 +840,400 @@ def create_app() -> FastAPI:
         content = target.read_text(encoding="utf-8", errors="replace")
         return {"path": path, "content": content[:400_000]}
 
+    # ------------------------------------------------------------------ refine
+
+    def _refine_report(book_id: str) -> Optional[Dict[str, Any]]:
+        path = DATA_ROOT / str(book_id) / "refines" / "refine_report.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    @app.post("/api/books/{book_id}/refine")
+    async def refine_start(book_id: str, payload: RefineIn):
+        get_book_or_404(book_id)
+        draft = dict(profile_or_404(payload.draft_profile_id)) if payload.draft_profile_id else None
+        refiner = dict(profile_or_404(payload.refiner_profile_id)) if payload.refiner_profile_id else None
+        if draft is None:
+            raise HTTPException(400, "draft_profile_id required (refine)")
+        if refiner is None:
+            raise HTTPException(400, "refiner_profile_id required (refine)")
+        checker = dict(profile_or_404(payload.checker_profile_id)) if payload.checker_profile_id else None
+        config: Dict[str, Any] = {
+            "language": payload.language,
+            "draft": draft,
+            "refiner": refiner,
+            "checker": checker,
+            "unload_after_call": payload.unload_after_call,
+            "chapter_ids": payload.chapter_ids,
+            "resume": payload.resume,
+            "batch_words": payload.batch_words,
+            "refine_rounds": payload.refine_rounds,
+            "similarity_stop": payload.similarity_stop,
+            "ratio_min": payload.ratio_min,
+            "ratio_max": payload.ratio_max,
+            "draft_temperature": payload.draft_temperature,
+            "style_probe": payload.style_probe,
+            "structured": payload.structured,
+            "check_mode": payload.check_mode,
+        }
+        await refines.get(book_id).start(config)
+        return {"status": refines.get(book_id)._meta()}
+
+    @app.get("/api/books/{book_id}/refine/status")
+    def refine_status(book_id: str):
+        get_book_or_404(book_id)
+        return {"status": refines.get(book_id)._meta()}
+
+    @app.post("/api/books/{book_id}/refine/stop")
+    async def refine_stop(book_id: str):
+        get_book_or_404(book_id)
+        runner = refines.get(book_id)
+        runner.stop()
+        return {"status": runner._meta()}
+
+    @app.get("/api/books/{book_id}/refine/progress")
+    def refine_progress(book_id: str):
+        get_book_or_404(book_id)
+        status = refines.get(book_id)._meta()
+        report = _refine_report(book_id)
+        chapters: List[Dict[str, Any]] = []
+        if report and report.get("chapters"):
+            chapters = [ch for ch in report["chapters"] if isinstance(ch, dict)]
+        elif report and report.get("batches"):
+            grouped: Dict[int, Dict[str, Any]] = {}
+            for entry in report["batches"]:
+                cid = int(entry.get("chapter_id") or 0)
+                row = grouped.setdefault(
+                    cid,
+                    {
+                        "chapter_id": cid,
+                        "chapter_name": entry.get("chapter_name") or "Untitled",
+                        "words_total": 0,
+                        "refined_words": 0,
+                        "batches_total": 0,
+                        "batches_done": 0,
+                        "paragraphs": 0,
+                        "review_flags": 0,
+                        "started": True,
+                        "done": False,
+                        "versions": refine_engine.existing_versions(
+                            DATA_ROOT / str(book_id) / "refined", cid
+                        ),
+                        "active_version": refine_engine.active_version(
+                            DATA_ROOT / str(book_id) / "refined", cid
+                        ),
+                    },
+                )
+                row["batches_total"] += 1
+                if entry.get("stage") == "done":
+                    row["batches_done"] += 1
+                    for item in entry.get("items") or []:
+                        row["refined_words"] += len((item.get("text") or "").split())
+                        row["paragraphs"] += 1 if item.get("text") else 0
+                row["review_flags"] += len(
+                    [
+                        flag
+                        for flag in entry.get("review") or []
+                        if flag.get("type") != "annotation" and not flag.get("decision")
+                    ]
+                )
+                row["done"] = row["batches_done"] == row["batches_total"]
+            chapters = [grouped[key] for key in sorted(grouped)]
+        return {
+            "mode": (report or {}).get("mode") or status.get("mode"),
+            "run_status": status.get("status"),
+            "batches_total": (report or {}).get("batches_total"),
+            "chapters": chapters,
+        }
+
+    @app.get("/api/books/{book_id}/refine/outputs")
+    def refine_outputs(book_id: str):
+        get_book_or_404(book_id)
+        base = (DATA_ROOT / str(book_id)).resolve()
+        outputs = []
+        for sub in ("refined", "refines"):
+            root = base / sub
+            if not root.exists():
+                continue
+            for path in sorted(root.rglob("*")):
+                if path.is_file() and not path.name.startswith("."):
+                    stat = path.stat()
+                    outputs.append(
+                        {
+                            "path": f"{sub}/{path.relative_to(root).as_posix()}",
+                            "size": stat.st_size,
+                            "modified": stat.st_mtime,
+                        }
+                    )
+        return {"outputs": outputs}
+
+    @app.get("/api/books/{book_id}/refine/file")
+    def refine_file(book_id: str, path: str):
+        get_book_or_404(book_id)
+        base = (DATA_ROOT / str(book_id)).resolve()
+        target = (base / path).resolve()
+        if not str(target).startswith(str(base)):
+            raise HTTPException(400, "invalid path")
+        relative = target.relative_to(base).as_posix()
+        if not (relative.startswith("refined/") or relative.startswith("refines/")):
+            raise HTTPException(400, "path must point into refined/ or refines/")
+        if target.suffix.lower() not in (".txt", ".md", ".json"):
+            raise HTTPException(400, "only .txt/.md/.json can be previewed")
+        if not target.is_file():
+            raise HTTPException(404, f"no such output: {path}")
+        content = target.read_text(encoding="utf-8", errors="replace")
+        return {"path": relative, "content": content[:400_000]}
+
+    @app.get("/api/books/{book_id}/refine/versions")
+    def refine_versions(book_id: str):
+        get_book_or_404(book_id)
+        book_dir = DATA_ROOT / str(book_id)
+        refined = book_dir / "refined"
+        chapters: List[Dict[str, Any]] = []
+        for chapter in store.written_chapters(book_id):
+            cid = int(chapter["id"])
+            versions: List[Dict[str, Any]] = []
+            for number in refine_engine.existing_versions(refined, cid):
+                payload = refine_engine.read_version(refined, cid, number) or {}
+                versions.append(
+                    {
+                        "version": number,
+                        "created": payload.get("created"),
+                        "words": payload.get("words") or 0,
+                        "review_flags": payload.get("review_flags") or 0,
+                        "models": payload.get("models") or {},
+                        "run_started_at": payload.get("run_started_at"),
+                    }
+                )
+            active = refine_engine.active_version(refined, cid) if versions else None
+            chapters.append(
+                {
+                    "chapter_id": cid,
+                    "chapter_name": chapter.get("name") or "Untitled",
+                    "original_words": len((chapter.get("content") or "").split()),
+                    "active_version": active,
+                    "versions": versions,
+                }
+            )
+        return {"chapters": chapters}
+
+    @app.get("/api/books/{book_id}/refine/version")
+    def refine_version(book_id: str, chapter_id: int, version: Optional[int] = None):
+        get_book_or_404(book_id)
+        refined = DATA_ROOT / str(book_id) / "refined"
+        payload = refine_engine.read_version(refined, chapter_id, version)
+        if payload is None:
+            raise HTTPException(404, "no such refined version")
+        return payload
+
+    @app.post("/api/books/{book_id}/refine/versions/select")
+    def refine_select_version(book_id: str, payload: RefineSelectIn):
+        get_book_or_404(book_id)
+        runner = refines.get(book_id)
+        if runner._task is not None and not runner._task.done():
+            raise HTTPException(409, "refiner busy; stop the run before switching versions")
+        try:
+            result = refine_engine.set_active_version(
+                DATA_ROOT / str(book_id), payload.chapter_id, payload.version
+            )
+        except ValueError as exc:
+            raise HTTPException(404, str(exc))
+        return {**result, "status": runner._meta()}
+
+    @app.post("/api/books/{book_id}/refine/reset-all")
+    async def refine_reset_all(book_id: str):
+        get_book_or_404(book_id)
+        runner = refines.get(book_id)
+        if runner._task is not None and not runner._task.done():
+            raise HTTPException(409, "refiner busy; stop the run before deleting")
+        removed = refine_engine.reset_refine_all(DATA_ROOT / str(book_id))
+        return {"removed": removed}
+
+    # --------------------------------------------------------- outline refine
+
+    def _outline_refine_report(book_id: str) -> Optional[Dict[str, Any]]:
+        path = DATA_ROOT / str(book_id) / "outline_refines" / "outline_refine_report.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    @app.post("/api/books/{book_id}/outline-refine")
+    async def outline_refine_start(book_id: str, payload: OutlineRefineIn):
+        get_book_or_404(book_id)
+        profile = dict(profile_or_404(payload.profile_id))
+        config: Dict[str, Any] = {
+            "profile": profile,
+            "chapter_ids": payload.chapter_ids,
+            "resume": payload.resume,
+            "refine_rounds": payload.refine_rounds,
+            "similarity_stop": payload.similarity_stop,
+            "context_prev": payload.context_prev,
+            "language": payload.language,
+            "unload_after_call": payload.unload_after_call,
+            "structured": payload.structured,
+            "style_probe": payload.style_probe,
+        }
+        await outline_refines.get(book_id).start(config)
+        return {"status": outline_refines.get(book_id)._meta()}
+
+    @app.get("/api/books/{book_id}/outline-refine/status")
+    def outline_refine_status(book_id: str):
+        get_book_or_404(book_id)
+        return {"status": outline_refines.get(book_id)._meta()}
+
+    @app.post("/api/books/{book_id}/outline-refine/stop")
+    async def outline_refine_stop(book_id: str):
+        get_book_or_404(book_id)
+        runner = outline_refines.get(book_id)
+        runner.stop()
+        return {"status": runner._meta()}
+
+    @app.get("/api/books/{book_id}/outline-refine/progress")
+    def outline_refine_progress(book_id: str):
+        get_book_or_404(book_id)
+        status = outline_refines.get(book_id)._meta()
+        report = _outline_refine_report(book_id)
+        chapters: List[Dict[str, Any]] = []
+        if report and report.get("chapters"):
+            chapters = [ch for ch in report["chapters"] if isinstance(ch, dict)]
+        else:
+            book = get_book_or_404(book_id)
+            refined = DATA_ROOT / str(book_id) / "outline_refined"
+            for chapter in sorted((book.get("outline") or {}).get("chapters") or [], key=lambda c: int(c["id"])):
+                cid = int(chapter["id"])
+                if not str(chapter.get("description") or "").strip():
+                    continue
+                chapters.append(
+                    {
+                        "chapter_id": cid,
+                        "chapter_name": chapter.get("name") or "Untitled",
+                        "word_count": int(chapter.get("word_count") or 0),
+                        "brief_words": 0,
+                        "started": False,
+                        "done": False,
+                        "review_notes": 0,
+                        "versions": outline_engine.existing_versions(refined, cid),
+                        "active_version": outline_engine.active_version(refined, cid),
+                    }
+                )
+        return {
+            "run_status": status.get("status"),
+            "batches_total": (report or {}).get("batches_total"),
+            "chapters": chapters,
+        }
+
+    @app.get("/api/books/{book_id}/outline-refine/outputs")
+    def outline_refine_outputs(book_id: str):
+        get_book_or_404(book_id)
+        base = (DATA_ROOT / str(book_id)).resolve()
+        outputs = []
+        for sub in ("outline_refined", "outline_refines"):
+            root = base / sub
+            if not root.exists():
+                continue
+            for path in sorted(root.rglob("*")):
+                if path.is_file() and not path.name.startswith("."):
+                    stat = path.stat()
+                    outputs.append(
+                        {
+                            "path": f"{sub}/{path.relative_to(root).as_posix()}",
+                            "size": stat.st_size,
+                            "modified": stat.st_mtime,
+                        }
+                    )
+        return {"outputs": outputs}
+
+    @app.get("/api/books/{book_id}/outline-refine/file")
+    def outline_refine_file(book_id: str, path: str):
+        get_book_or_404(book_id)
+        base = (DATA_ROOT / str(book_id)).resolve()
+        target = (base / path).resolve()
+        if not str(target).startswith(str(base)):
+            raise HTTPException(400, "invalid path")
+        relative = target.relative_to(base).as_posix()
+        if not (relative.startswith("outline_refined/") or relative.startswith("outline_refines/")):
+            raise HTTPException(400, "path must point into outline_refined/ or outline_refines/")
+        if target.suffix.lower() not in (".txt", ".md", ".json"):
+            raise HTTPException(400, "only .txt/.md/.json can be previewed")
+        if not target.is_file():
+            raise HTTPException(404, f"no such output: {path}")
+        content = target.read_text(encoding="utf-8", errors="replace")
+        return {"path": relative, "content": content[:400_000]}
+
+    @app.get("/api/books/{book_id}/outline-refine/versions")
+    def outline_refine_versions(book_id: str):
+        get_book_or_404(book_id)
+        refined = DATA_ROOT / str(book_id) / "outline_refined"
+        chapters: List[Dict[str, Any]] = []
+        for chapter in sorted(
+            (get_book_or_404(book_id).get("outline") or {}).get("chapters") or [],
+            key=lambda c: int(c["id"]),
+        ):
+            cid = int(chapter["id"])
+            if not str(chapter.get("description") or "").strip():
+                continue
+            versions: List[Dict[str, Any]] = []
+            for number in outline_engine.existing_versions(refined, cid):
+                payload = outline_engine.read_version(refined, cid, number) or {}
+                versions.append(
+                    {
+                        "version": number,
+                        "created": payload.get("created"),
+                        "words": payload.get("words") or 0,
+                        "models": payload.get("models") or {},
+                    }
+                )
+            chapters.append(
+                {
+                    "chapter_id": cid,
+                    "chapter_name": chapter.get("name") or "Untitled",
+                    "original_words": len((chapter.get("description") or "").split()),
+                    "active_version": outline_engine.active_version(refined, cid) if versions else None,
+                    "versions": versions,
+                }
+            )
+        return {"chapters": chapters}
+
+    @app.get("/api/books/{book_id}/outline-refine/version")
+    def outline_refine_version(book_id: str, chapter_id: int, version: Optional[int] = None):
+        get_book_or_404(book_id)
+        payload = outline_engine.read_version(DATA_ROOT / str(book_id) / "outline_refined", chapter_id, version)
+        if payload is None:
+            raise HTTPException(404, "no such refined outline version")
+        return payload
+
+    @app.post("/api/books/{book_id}/outline-refine/versions/select")
+    def outline_refine_select_version(book_id: str, payload: OutlineRefineSelectIn):
+        get_book_or_404(book_id)
+        runner = outline_refines.get(book_id)
+        if runner._task is not None and not runner._task.done():
+            raise HTTPException(409, "outline refiner busy; stop the run before switching versions")
+        try:
+            result = outline_engine.set_active_version(DATA_ROOT / str(book_id), payload.chapter_id, payload.version)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc))
+        return {**result, "status": runner._meta()}
+
+    @app.post("/api/books/{book_id}/outline-refine/reset-all")
+    async def outline_refine_reset_all(book_id: str):
+        get_book_or_404(book_id)
+        runner = outline_refines.get(book_id)
+        if runner._task is not None and not runner._task.done():
+            raise HTTPException(409, "outline refiner busy; stop the run before deleting")
+        removed = outline_engine.reset_outline_refine_all(DATA_ROOT / str(book_id))
+        return {"removed": removed}
+
     @app.get("/api/books/{book_id}/events")
     async def events(book_id: str):
         get_book_or_404(book_id)
         runner = runners.get(book_id)
         translations.get(book_id).bind_emit(runner._emit)
+        refines.get(book_id).bind_emit(runner._emit)
+        outline_refines.get(book_id).bind_emit(runner._emit)
         queue = await runner.subscribe()
 
         async def generator():
@@ -969,6 +1432,50 @@ def create_app() -> FastAPI:
             raise HTTPException(exc.status, exc.message)
         return {"open_flags": payload_row["open_flags"], "total_flags": payload_row["total_flags"], "review": payload_row}
 
+    @app.post("/api/books/{book_id}/translate/review/annotations/read")
+    def translate_annotations_read(book_id: str, payload: Dict[str, Any]):
+        """Mark annotations read — writes ONLY the side file, so it stays
+        instant even while a translation run is rewriting the report."""
+        book = get_book_or_404(book_id)
+        ids = (payload or {}).get("ids")
+        if not isinstance(ids, list) or not ids:
+            raise HTTPException(400, "ids required")
+        language = _review_language(book)
+        merged = review_add_read_marks(DATA_ROOT, book_id, language, ids)
+        review = build_review_response(DATA_ROOT, book_id, language)
+        return {"read_count": len(merged), "review": review}
+
+    @app.post("/api/books/{book_id}/translate/review/fix-paragraph")
+    def translate_fix_paragraph(book_id: str, payload: Dict[str, Any]):
+        """Direct German text edit from the review GUI — writes into all outputs."""
+        book = get_book_or_404(book_id)
+        translation_runner = translations.get(book_id)
+        if translation_runner._task is not None and not translation_runner._task.done():
+            raise HTTPException(409, "translation run is active — text edits are locked while it runs")
+        try:
+            batch_index = int((payload or {}).get("batch_index"))
+            paragraph = int((payload or {}).get("paragraph"))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "batch_index and paragraph required")
+        try:
+            payload_row = review_fix_paragraph(
+                DATA_ROOT,
+                book_id,
+                _review_language(book),
+                book.get("title") or "",
+                batch_index,
+                paragraph,
+                str((payload or {}).get("text") or ""),
+            )
+        except ReviewError as exc:
+            raise HTTPException(exc.status, exc.message)
+        return {
+            "open_flags": payload_row["open_flags"],
+            "total_flags": payload_row["total_flags"],
+            "edited_paragraph": payload_row.get("edited_paragraph"),
+            "review": payload_row,
+        }
+
     @app.post("/api/books/{book_id}/translate/review/retranslate")
     async def translate_review_retranslate(book_id: str, payload: Dict[str, Any]):
         """Re-run draft → refine → check for one corrupted batch (same chain)."""
@@ -981,13 +1488,13 @@ def create_app() -> FastAPI:
             batch_index = int((payload or {}).get("batch_index"))
         except (TypeError, ValueError):
             raise HTTPException(400, "batch_index required")
-        authorial_path, ensemble_path = review_report_files(DATA_ROOT, book_id, language)
-        if authorial_path is None:
-            raise HTTPException(404, f"no authorial report for language {language}")
-        if ensemble_path is not None:
+        report_path, report_mode = review_current_report(DATA_ROOT, book_id, language)
+        if report_path is None:
+            raise HTTPException(404, f"no report for language {language}")
+        if report_mode == "ensemble":
             raise HTTPException(400, "the latest report for this language is an ensemble report")
         try:
-            report = json.loads(authorial_path.read_text(encoding="utf-8"))
+            report = json.loads(report_path.read_text(encoding="utf-8"))
         except Exception as exc:
             raise HTTPException(500, f"report unreadable ({exc}) — restore the .bak first")
         if report.get("mode") != "authorial":
@@ -1028,17 +1535,109 @@ def create_app() -> FastAPI:
                 min(1.0, max(0.5, float(settings.get("similarity_stop") or 0.97))),
                 min(2.0, max(0.1, float(settings.get("ratio_min") or 0.85))),
                 min(5.0, max(0.5, float(settings.get("ratio_max") or 1.45))),
+                structured=bool(meta.get("structured", True)),
+                check_mode=str(meta.get("check_mode") or (meta.get("settings") or {}).get("check_mode") or "essential"),
             )
         except (LlmError, ValueError) as exc:
             raise HTTPException(502, f"retranslation failed: {exc}")
         entries[position] = new_entry
         report["batches"] = entries
-        shutil.copyfile(authorial_path, authorial_path.with_suffix(".json.bak"))
-        writer = AuthorialWriter(authorial_path.parent)
+        shutil.copyfile(report_path, report_path.with_suffix(".json.bak"))
+        writer = AuthorialWriter(report_path.parent)
         restore_writer(writer, report)
         writer.persist(meta, book.get("title") or "")
         payload_row = collect_rows(writer.as_report(meta), editable=True)
         return {"open_flags": payload_row["open_flags"], "total_flags": payload_row["total_flags"], "review": payload_row}
+
+    @app.post("/api/books/{book_id}/translate/reset-all")
+    def translate_reset_all(book_id: str):
+        """Clean slate: delete the whole translation directory — every report,
+        output file, read-marker — for ALL languages of this book."""
+        get_book_or_404(book_id)
+        runner = translations.get(book_id)
+        if runner._task is not None and not runner._task.done():
+            raise HTTPException(409, "translation run is active — stop it first")
+        base = DATA_ROOT / str(book_id) / "translations"
+        removed: List[str] = []
+        if base.exists():
+            import shutil as _sh
+
+            for child in sorted(base.iterdir()):
+                if child.is_dir():
+                    _sh.rmtree(child)
+                    removed.append(child.name)
+                else:
+                    child.unlink()
+                    removed.append(child.name)
+        return {"removed": removed}
+
+    @app.post("/api/books/{book_id}/translate/review/reset-chapter")
+    def translate_reset_chapter(book_id: str, payload: Dict[str, Any]):
+        """Reset ONE chapter's translation batches so Resume redoes only them
+        (with the current output mode — e.g. the structured tool call)."""
+        book = get_book_or_404(book_id)
+        translation_runner = translations.get(book_id)
+        if translation_runner._task is not None and not translation_runner._task.done():
+            raise HTTPException(409, "translation run is active — stop it first")
+        try:
+            chapter_id = int((payload or {}).get("chapter_id"))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "chapter_id required")
+        language = _review_language(book)
+        report_path, report_mode = review_current_report(DATA_ROOT, book_id, language)
+        if report_path is None:
+            raise HTTPException(404, f"no report for language {language}")
+        if report_mode == "ensemble":
+            raise HTTPException(400, "the latest report for this language is an ensemble report")
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise HTTPException(500, f"report unreadable ({exc}) — restore the .bak first")
+        if report.get("mode") != "authorial":
+            raise HTTPException(400, "chapter reset is only available for authorial runs")
+        meta = {key: value for key, value in report.items() if key not in ("chapters", "batches")}
+        entries = report.get("batches") or []
+        fresh: List[Dict[str, Any]] = []
+        reset_batches = 0
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("chapter_id") == chapter_id:
+                # placeholder WITH the real source_hash: resume keeps the slot
+                # in place, stage "draft" makes the run re-process exactly this
+                # batch with the current output mode
+                fresh.append(
+                    {
+                        "index": entry.get("index"),
+                        "chapter_id": chapter_id,
+                        "chapter_name": entry.get("chapter_name") or "",
+                        "source_hash": entry.get("source_hash"),
+                        "stage": "draft",
+                        "draft_error": None,
+                        "draft_text": "",
+                        "draft_notes": [],
+                        "heading": None,
+                        "german_segments": [],
+                        "items": [],
+                        "review": [],
+                        "errors": [],
+                    }
+                )
+                reset_batches += 1
+            else:
+                fresh.append(entry)
+        if not reset_batches:
+            raise HTTPException(404, f"chapter {chapter_id} has no batches in the report")
+        report["batches"] = fresh
+        shutil.copyfile(report_path, report_path.with_suffix(".json.bak"))
+        writer = AuthorialWriter(report_path.parent)
+        restore_writer(writer, report)
+        writer.persist(meta, book.get("title") or "")
+        payload_row = collect_rows(writer.as_report(meta), editable=True)
+        return {
+            "open_flags": payload_row["open_flags"],
+            "total_flags": payload_row["total_flags"],
+            "reset_batches": reset_batches,
+            "review": payload_row,
+        }
 
     # ------------------------------------------------------------------ #
     # Layout tab (Feature 3) — images/prompts/illustration positions

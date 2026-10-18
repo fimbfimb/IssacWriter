@@ -73,6 +73,11 @@ export type Book = {
   runner?: RunnerStatus;
   translation?: TranslationStatus;
   translation_settings?: Record<string, any>;
+  refine?: RefineStatus;
+  refine_settings?: Record<string, any>;
+  refined_descriptions_source?: boolean;
+  outline_refine?: RefineStatus;
+  outline_refine_settings?: Record<string, any>;
   author_notes?: string;
   last_error?: string;
 };
@@ -116,6 +121,34 @@ export type TranslationStatus = {
   interrupted: boolean;
   task_alive?: boolean;
   tool: TranslationToolStatus;
+  source_mode?: "original" | "refined" | string;
+  refined_used?: number[];
+  refined_fallback?: number[];
+  activity?: LlmActivity | null;
+  last_activity?: number | null;
+};
+
+export type LlmActivity = {
+  role: string;
+  detail: string;
+  since: number;
+};
+
+export type RefineStatus = {
+  status: string;
+  error: string | null;
+  output_file: string | null;
+  language: string | null;
+  profile_name: string | null;
+  model: string | null;
+  batch_words: number;
+  mode: string;
+  started_at: number | null;
+  finished_at: number | null;
+  interrupted: boolean;
+  task_alive?: boolean;
+  activity?: LlmActivity | null;
+  last_activity?: number | null;
 };
 
 export type ReviewDecision = {
@@ -138,6 +171,7 @@ export type ReviewRow = {
   decision: ReviewDecision | null;
   history_count: number;
   editable: boolean;
+  paragraphs?: { index: number; source: string; text: string }[];
 };
 
 export type ReviewResponse = {

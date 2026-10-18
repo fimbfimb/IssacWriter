@@ -23,10 +23,14 @@ export default function ReviewCard({
   showToast: (m: string) => void;
 }) {
   const [review, setReview] = useState<ReviewResponse | null>(null);
-  const [openRowId, setOpenRowId] = useState<string | null>(null);
+  const [openFlagRowId, setOpenFlagRowId] = useState<string | null>(null);
   const [edited, setEdited] = useState<Record<string, string>>({});
   const [working, setWorking] = useState(false);
   const [onlyOpen, setOnlyOpen] = useState(true);
+  const [annotationsOpen, setAnnotationsOpen] = useState(false);
+  const [openAnnotationChapters, setOpenAnnotationChapters] = useState<Set<number>>(new Set());
+  const [editRowId, setEditRowId] = useState<string | null>(null);
+  const [editDrafts, setEditDrafts] = useState<Record<string, string>>({});
 
   const refresh = () =>
     api
@@ -36,25 +40,106 @@ export default function ReviewCard({
 
   useEffect(() => {
     refresh();
-  }, [book.id]);
+    // poll while a translation runs: reset/retranslate/resume land new flags in
+    // the report continuously, so the card must update itself without a click
+    if (!busyTranslation) return;
+    const timer = window.setInterval(refresh, 3000);
+    return () => window.clearInterval(timer);
+  }, [book.id, busyTranslation]);
 
-  const openFlags = review?.open_flags ?? 0;
-  const rows = useMemo(() => review?.chapters ?? [], [review]);
-  const visible = useMemo(() => {
-    if (!onlyOpen) return rows;
-    return rows
+  const setRead = async (ids: string[]) => {
+    setWorking(true);
+    try {
+      const result = await api.translateAnnotationsRead(book.id, ids);
+      setReview(result.review);
+    } catch (err: any) {
+      showToast(err.message);
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  // direct in-place German edit right below the annotation — writes into all
+  // outputs (manuscript.md, book_german.txt, bilingual) and marks the note read
+  const saveFix = async (
+    row: ReviewRow,
+    paragraph: number,
+    text: string,
+  ) => {
+    setWorking(true);
+    try {
+      const result = await api.translateFixParagraph(book.id, {
+        batch_index: row.batch_index,
+        paragraph,
+        text,
+      });
+      setReview(result.review);
+      await refreshBook();
+      showToast("Text übernommen — alle Ausgaben neu geschrieben");
+      if (row.decision === null || row.decision?.action !== "fixed") {
+        await setRead([row.id]);
+      }
+    } catch (err: any) {
+      showToast(err.message);
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  const draftKey = (row: ReviewRow, key: number | string) => `${row.id}:${key}`;
+
+  // a batch with missing German placeholder text or structural flags can be
+  // re-translated with the same chain from the report's profiles
+  const retranslate = async (row: ReviewRow) => {
+    setWorking(true);
+    try {
+      const result = await api.translateRetranslateBatch(book.id, row.batch_index);
+      setReview(result.review);
+      await refreshBook();
+      showToast("Block retranslated — fresh flags replace the old ones");
+    } catch (err: any) {
+      showToast(err.message);
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  const isPlaceholderText = (row: ReviewRow) =>
+    row.text_de &&
+    row.text_de.trim().length <= 60 &&
+    /^\[[^\[\]\n]{1,40}\]$/.test(row.text_de.trim());
+
+  // ALL hooks stay above the early return — a conditional hook count would
+  // crash the whole tab exactly when the first data arrives
+  const flagChapters = useMemo(() => {
+    return (review?.chapters ?? [])
       .map((chapter) => ({
         ...chapter,
-        rows: chapter.rows.filter((row) => row.type === "annotation" || !row.decision),
+        rows: chapter.rows.filter((row) => row.type !== "annotation" && (!onlyOpen || !row.decision)),
       }))
       .filter((chapter) => chapter.rows.length > 0);
-  }, [rows, onlyOpen]);
+  }, [review, onlyOpen]);
 
-  // annotation rows are info rows: they also need the "understood" click to disappear
-  const decide = async (
-    row: ReviewRow,
-    action: "accepted" | "fixed" | "dismissed",
-  ) => {
+  const annotationChapters = useMemo(() => {
+    return (review?.chapters ?? [])
+      .map((chapter) => ({
+        ...chapter,
+        rows: chapter.rows.filter((row) => row.type === "annotation"),
+      }))
+      .filter((chapter) => chapter.rows.length > 0);
+  }, [review]);
+  const openAnnotations = useMemo(
+    () => annotationChapters.flatMap((chapter) => chapter.rows.filter((row) => !row.decision)),
+    [annotationChapters],
+  );
+  const readAnnotations = useMemo(
+    () => annotationChapters.flatMap((chapter) => chapter.rows.filter((row) => row.decision)),
+    [annotationChapters],
+  );
+
+  if (!review) return null;
+
+  const decide = async (row: ReviewRow, action: "accepted" | "fixed" | "dismissed") => {
     setWorking(true);
     try {
       const result = await api.translateReviewDecide(book.id, {
@@ -83,81 +168,27 @@ export default function ReviewCard({
     }
   };
 
-  // a batch with missing German placeholder text or structural flags can be
-  // re-translated with the same chain from the report's profiles
-  const retranslate = async (row: ReviewRow) => {
-    setWorking(true);
-    try {
-      const result = await api.translateRetranslateBatch(book.id, row.batch_index);
-      setReview(result.review);
-      await refreshBook();
-      showToast("Block retranslated — fresh flags replace the old ones");
-    } catch (err: any) {
-      showToast(err.message);
-    } finally {
-      setWorking(false);
-    }
+  const toggleAnnotationChapter = (chapterId: number) => {
+    setOpenAnnotationChapters((prev) => {
+      const next = new Set(prev);
+      if (next.has(chapterId)) next.delete(chapterId);
+      else next.add(chapterId);
+      return next;
+    });
   };
 
-  const openAnnotations = useMemo(() => {
-    const rows: ReviewRow[] = [];
-    for (const chapter of review?.chapters ?? []) {
-      for (const row of chapter.rows) {
-        if (row.type === "annotation" && !row.decision) rows.push(row);
-      }
-    }
-    return rows;
-  }, [review]);
-
-  const markAllAnnotationsRead = async () => {
-    setWorking(true);
-    try {
-      for (const row of openAnnotations) {
-        await api.translateReviewDecide(book.id, {
-          batch_index: row.batch_index,
-          chapter_id: row.chapter_id,
-          type: row.type,
-          paragraph: row.paragraph,
-          detail: row.detail,
-          action: "accepted",
-          text: null,
-        });
-      }
-      await refresh();
-      await refreshBook();
-      showToast("Alle Anmerkungen als verstanden markiert");
-    } catch (err: any) {
-      showToast(err.message);
-      await refresh();
-    } finally {
-      setWorking(false);
-    }
-  };
-
-  const isPlaceholderText =
-    (row: ReviewRow) =>
-      row.text_de &&
-      row.text_de.trim().length <= 60 &&
-      /^\[[^\[\]\n]{1,40}\]$/.test(row.text_de.trim());
-
-  if (!review) return null;
-  if (review.total_flags === 0 && review.open_flags === 0 && !review.hint) return null;
+  const locked = busyTranslation || working;
 
   return (
     <div className="card">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", flexWrap: "wrap", gap: 8 }}>
         <strong>
           Review — flags with a decision{" "}
-          <span style={{ color: openFlags ? "var(--warn)" : "var(--good)", marginLeft: 6 }}>
-            {openFlags} open
+          <span style={{ color: review.open_flags ? "var(--warn)" : "var(--good)", marginLeft: 6 }}>
+            {review.open_flags} open
           </span>
         </strong>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          {openAnnotations.length > 0 && (
-            <button onClick={markAllAnnotationsRead} disabled={busyTranslation || working}>
-              Alle Anmerkungen verstanden ({openAnnotations.length})
-            </button>
-          )}
           <label style={{ fontSize: 12, color: "var(--text-dim)", display: "flex", alignItems: "center", gap: 4 }}>
             <input type="checkbox" checked={onlyOpen} onChange={(e) => setOnlyOpen(e.target.checked)} /> only open
           </label>
@@ -166,26 +197,20 @@ export default function ReviewCard({
       </div>
       <div className="inline-note">
         {review.hint ??
-          "Each flag: context view, then decide. Correction writes the new text directly into all outputs. Lock while a translation pass is running."}
+          "Flags (length/fidelity/…) need your decision. Annotations are model info — read-marking is instant, even during a run."}
         {review.mode === "ensemble" && " · Ensemble report: read-only view."}
-        {busyTranslation && " · translation is running — decisions are locked"}
+        {busyTranslation && " · translation is running — flag decisions are locked, annotations stay clickable"}
       </div>
 
-      {visible.length === 0 && openFlags === 0 && (
-        <div className="muted" style={{ padding: 8 }}>
-          {review.report_path ? "All flags processed. Nothing left open." : "No report yet."}
-        </div>
-      )}
-
-      {visible.map((chapter) => (
+      {/* ------------------------------- FLAGS ------------------------------- */}
+      {flagChapters.map((chapter) => (
         <div key={chapter.chapter_id} style={{ marginTop: 8 }}>
           <div className="muted" style={{ fontSize: 12.5, fontWeight: 600, marginBottom: 2 }}>
             {chapter.chapter_name}
           </div>
           {chapter.rows.map((row) => {
             const decided = !!row.decision;
-            const open = openRowId === row.id;
-            const locked = !row.editable || busyTranslation || working;
+            const open = openFlagRowId === row.id;
             return (
               <div
                 key={row.id}
@@ -199,10 +224,10 @@ export default function ReviewCard({
                   style={{ display: "flex", gap: 8, alignItems: "baseline", cursor: "pointer" }}
                   onClick={() => {
                     if (open) {
-                      setOpenRowId(null);
+                      setOpenFlagRowId(null);
                       return;
                     }
-                    setOpenRowId(row.id);
+                    setOpenFlagRowId(row.id);
                     setEdited((prev) => ({
                       ...prev,
                       [row.id]: row.decision?.action === "fixed" ? row.decision?.edited_text ?? row.text_de ?? "" : row.text_de ?? "",
@@ -235,56 +260,39 @@ export default function ReviewCard({
                       </>
                     )}
                     <div className="muted" style={{ fontSize: 11.5 }}>
-                      {row.type === "annotation" && row.paragraph === null && row.text_de === ""
-                        ? "Note (no paragraph affected)"
-                        : "German paragraph"}
-                      {row.paragraph === null && row.type !== "annotation" && " — flag affects the whole batch"}
+                      {row.paragraph === null && " — flag affects the whole batch"}
                     </div>
-                    {row.type !== "annotation" && row.text_de && (
+                    {row.text_de && (
                       <textarea
                         rows={Math.min(8, Math.max(3, Math.ceil((row.text_de.length || 1) / 90)))}
                         value={edited[row.id] ?? row.text_de}
                         onChange={(e) => setEdited((prev) => ({ ...prev, [row.id]: e.target.value }))}
                       />
                     )}
-                    {row.type === "annotation" ? (
-                      <button
-                        className="btn-primary"
-                        disabled={locked || !!row.decision && onlyOpen}
-                        onClick={() => decide(row, "accepted")}
-                      >
-                        Verstanden
+                    <div style={{ display: "flex", gap: 8, marginTop: 6, flexWrap: "wrap" }}>
+                      <button disabled={locked} onClick={() => decide(row, "accepted")}>
+                        ✔ Akzeptiert
                       </button>
-                    ) : (
-                      <div style={{ display: "flex", gap: 8, marginTop: 6, flexWrap: "wrap" }}>
-                        <button disabled={locked} onClick={() => decide(row, "accepted")}>
-                          ✔ Akzeptiert
-                        </button>
-                        <button
-                          className="btn-danger"
-                          disabled={locked}
-                          onClick={() => decide(row, "fixed")}
-                        >
-                          ✎ Korrigieren
-                        </button>
-                        <button disabled={locked} onClick={() => decide(row, "dismissed")}>
-                          Verwerfen
-                        </button>
-                        <button
-                          className="btn-ghost"
-                          disabled={locked}
-                          title="Führt Entwurf → Verfeinerung → Prüfung für diesen Block erneut aus (gleiche Modelle, wie im Report). Überschreibt Alt-Fassung samt Flags."
-                          onClick={() => retranslate(row)}
-                        >
-                          ⟳ Block neu übersetzen
-                        </button>
-                        {isPlaceholderText(row) && (
-                          <span className="chip" style={{ color: "var(--bad)", borderColor: "var(--bad)" }}>
-                            deutscher Text fehlt (Platzhalter)
-                          </span>
-                        )}
-                      </div>
-                    )}
+                      <button className="btn-danger" disabled={locked} onClick={() => decide(row, "fixed")}>
+                        ✎ Korrigieren
+                      </button>
+                      <button disabled={locked} onClick={() => decide(row, "dismissed")}>
+                        Verwerfen
+                      </button>
+                      <button
+                        className="btn-ghost"
+                        disabled={locked}
+                        title="Entwurf → Verfeinerung → Prüfung für diesen Block erneut ausführen (gleiche Modelle wie im Report). Überschreibt Alt-Fassung samt Flags."
+                        onClick={() => retranslate(row)}
+                      >
+                        ⟳ Block neu übersetzen
+                      </button>
+                      {isPlaceholderText(row) && (
+                        <span className="chip" style={{ color: "var(--bad)", borderColor: "var(--bad)" }}>
+                          deutscher Text fehlt (Platzhalter)
+                        </span>
+                      )}
+                    </div>
                   </div>
                 )}
               </div>
@@ -292,6 +300,187 @@ export default function ReviewCard({
           })}
         </div>
       ))}
+
+      {/* --------------------------- ANNOTATIONS ---------------------------- */}
+      {annotationChapters.length > 0 && (
+        <div
+          style={{
+            marginTop: 12,
+            border: "1px solid var(--border)",
+            borderRadius: 8,
+            padding: "8px 10px",
+          }}
+        >
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <button
+              onClick={() => setAnnotationsOpen((v) => !v)}
+              disabled={working}
+              title="Anmerkungen = bewusste Änderungen, die das Modell beim Übersetzen gemacht hat. Rein informativ — nicht zu entscheiden."
+            >
+              {annotationsOpen ? "▾" : "▸"} Anmerkungen ({openAnnotations.length} offen · {readAnnotations.length} erledigt)
+            </button>
+            {openAnnotations.length > 0 && (
+              <button onClick={() => setRead(openAnnotations.map((row) => row.id))} disabled={working}>
+                Alle verstanden ({openAnnotations.length})
+              </button>
+            )}
+            <span className="muted" style={{ fontSize: 12 }}>
+              default zu — pro Kapitel aufklappen
+            </span>
+          </div>
+
+          {annotationsOpen && (
+            <div style={{ marginTop: 6 }}>
+              {annotationChapters.map((chapter) => {
+                const expanded = openAnnotationChapters.has(chapter.chapter_id);
+                const counts = chapter.rows.reduce((acc, row) => (row.decision ? acc : acc + 1), 0);
+                return (
+                  <div key={chapter.chapter_id} style={{ borderTop: "1px solid var(--border)", padding: "6px 0" }}>
+                    <div
+                      style={{ display: "flex", gap: 8, alignItems: "baseline", cursor: "pointer" }}
+                      onClick={() => toggleAnnotationChapter(chapter.chapter_id)}
+                    >
+                      <span className="muted" style={{ fontSize: 11 }}>
+                        {expanded ? "▲" : "▼"}
+                      </span>
+                      <span style={{ fontWeight: 600, fontSize: 12.5 }}>{chapter.chapter_name}</span>
+                      <span className="muted" style={{ fontSize: 11.5 }}>
+                        {counts} offen / {chapter.rows.length} gesamt
+                      </span>
+                      {!expanded && counts > 0 && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setRead(chapter.rows.filter((row) => !row.decision).map((row) => row.id));
+                          }}
+                          disabled={working}
+                          style={{ fontSize: 11.5, padding: "2px 8px" }}
+                        >
+                          Kapitel komplett verstanden
+                        </button>
+                      )}
+                    </div>
+                    {expanded &&
+                      chapter.rows.map((row) => {
+                        const editing = editRowId === row.id;
+                        const paragraphsToEdit =
+                          row.paragraph !== null
+                            ? [{ index: row.paragraph, source: row.source_en, text: row.text_de }]
+                            : row.paragraphs ?? [];
+                        return (
+                          <div
+                            key={row.id}
+                            style={{
+                              padding: "4px 4px 4px 26px",
+                              borderBottom: "1px solid var(--border)",
+                              opacity: row.decision ? 0.55 : 1,
+                            }}
+                          >
+                            <div style={{ display: "flex", gap: 8, alignItems: "baseline" }}>
+                              <span className="muted" style={{ fontSize: 11, minWidth: 30, textAlign: "right" }}>
+                                {row.paragraph !== null ? `¶${row.paragraph + 1}` : "Batch"}
+                              </span>
+                              <span style={{ flex: 1, fontSize: 12.5 }}>{row.detail}</span>
+                              {row.decision ? (
+                                <span className="chip" style={{ color: "var(--good)" }}>
+                                  {row.decision.action === "read" ? "verstanden ✓" : row.decision.action}
+                                </span>
+                              ) : (
+                                <>
+                                  <button
+                                    onClick={() => {
+                                      if (editing) {
+                                        setEditRowId(null);
+                                        return;
+                                      }
+                                      setEditRowId(row.id);
+                                      setEditDrafts((prev) => {
+                                        const next = { ...prev };
+                                        for (const p of paragraphsToEdit) {
+                                          next[draftKey(row, p.index)] =
+                                            next[draftKey(row, p.index)] ?? p.text ?? "";
+                                        }
+                                        return next;
+                                      });
+                                    }}
+                                    disabled={working}
+                                    style={{ fontSize: 11.5, padding: "2px 8px" }}
+                                  >
+                                    {editing ? "▲" : "✎ ändern"}
+                                  </button>
+                                  <button
+                                    onClick={() => setRead([row.id])}
+                                    disabled={working}
+                                    style={{ fontSize: 11.5, padding: "2px 8px" }}
+                                  >
+                                    Verstanden
+                                  </button>
+                                </>
+                              )}
+                            </div>
+                            {editing && (
+                              <div style={{ margin: "6px 0 8px 38px" }}>
+                                {row.source_en && (
+                                  <div className="muted" style={{ fontSize: 11 }}>Original (read-only)</div>
+                                )}
+                                {row.source_en && row.paragraph !== null && (
+                                  <pre className="prose-view" style={{ maxHeight: 90, fontSize: 12, margin: "2px 0 6px" }}>
+                                    {row.source_en}
+                                  </pre>
+                                )}
+                                {paragraphsToEdit.length === 0 ? (
+                                  <div className="muted" style={{ fontSize: 11.5 }}>
+                                    Keine Paragraphen in diesem Block bearbeitbar (Stage nicht abgeschlossen).
+                                  </div>
+                                ) : (
+                                  paragraphsToEdit.map((p) => (
+                                    <div key={p.index} style={{ marginBottom: 8 }}>
+                                      {row.paragraph === null && (
+                                        <div className="muted" style={{ fontSize: 11 }}>
+                                          Absatz {p.index + 1}
+                                          {row.source_en && ""}
+                                        </div>
+                                      )}
+                                      {row.paragraph === null && p.source && (
+                                        <pre className="prose-view" style={{ maxHeight: 80, fontSize: 11.5, margin: "2px 0 4px" }}>
+                                          {p.source}
+                                        </pre>
+                                      )}
+                                      <textarea
+                                        rows={Math.min(8, Math.max(3, Math.ceil((p.text.length || 1) / 90)))}
+                                        value={editDrafts[draftKey(row, p.index)] ?? p.text ?? ""}
+                                        onChange={(e) =>
+                                          setEditDrafts((prev) => ({ ...prev, [draftKey(row, p.index)]: e.target.value }))
+                                        }
+                                      />
+                                      <button
+                                        className="btn-primary"
+                                        disabled={working}
+                                        onClick={() => saveFix(row, p.index, editDrafts[draftKey(row, p.index)] ?? p.text)}
+                                      >
+                                        Übernehmen
+                                      </button>
+                                    </div>
+                                  ))
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {flagChapters.length === 0 && review.open_flags === 0 && (
+        <div className="muted" style={{ padding: 8 }}>
+          {review.report_path ? "Keine offenen Flags — nur Anmerkungen vorhanden." : "No report yet."}
+        </div>
+      )}
     </div>
   );
 }

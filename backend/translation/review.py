@@ -36,6 +36,8 @@ from .authorial import (
     refine_messages,
     split_paragraphs,
     similar_ratio,
+    call_structured,
+    is_echo_of_text,
     _is_junk_note,
     _review_note,
 )
@@ -80,6 +82,31 @@ def report_files(data_root: Path, book_id: str, language: str) -> Tuple[Optional
     return authorial, ensemble
 
 
+def current_report(data_root: Path, book_id: str, language: str) -> Tuple[Optional[Path], Optional[str]]:
+    """The newest report in the language dir: (path, mode).
+
+    Both authorial and ensemble reports can coexist (an old ensemble run);
+    the file that was written LAST decides the mode of the review surface.
+    """
+    base = report_dir(data_root, book_id, language)
+    candidates: List[Tuple[float, Path, str]] = []
+    for name, mode in (
+        ("authorial_report.json", "authorial"),
+        ("ensemble_report.json", "ensemble"),
+    ):
+        path = base / name
+        if path.is_file():
+            try:
+                if json.loads(path.read_text(encoding="utf-8")):
+                    candidates.append((path.stat().st_mtime, path, mode))
+            except Exception:
+                continue
+    if not candidates:
+        return None, None
+    candidates.sort(key=lambda row: row[0], reverse=True)
+    return candidates[0][1], candidates[0][2]
+
+
 def _row_texts(entry: Dict[str, Any], paragraph: Optional[int]) -> Tuple[str, str]:
     """(english source, german text) for one flag."""
     items = entry.get("items") or []
@@ -111,7 +138,31 @@ def _flag_id(row: Dict[str, Any]) -> str:
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
 
 
-def collect_rows(report: Dict[str, Any], editable: bool) -> Dict[str, Any]:
+def annotations_read_path(data_root: Path, book_id: str, language: str) -> Path:
+    return report_dir(data_root, book_id, language) / "annotations_read.json"
+
+
+def load_read_marks(data_root: Path, book_id: str, language: str) -> set:
+    """Row-ids of annotations the user marked as read (side file, never the
+    report — so marking stays instant even while a translation is running)."""
+    try:
+        data = json.loads(annotations_read_path(data_root, book_id, language).read_text(encoding="utf-8"))
+        return set(str(x) for x in (data.get("read") or [])) if isinstance(data, dict) else set()
+    except Exception:
+        return set()
+
+
+def add_read_marks(data_root: Path, book_id: str, language: str, ids) -> set:
+    merged = load_read_marks(data_root, book_id, language) | {str(i) for i in ids if i}
+    path = annotations_read_path(data_root, book_id, language)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"read": sorted(merged)}, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+    return merged
+
+
+def collect_rows(report: Dict[str, Any], editable: bool, read_ids: Optional[set] = None) -> Dict[str, Any]:
     """Group flag rows by chapter; annotate each with texts + decision state."""
     batches = report.get("batches") or []
     grouped: Dict[int, Dict[str, Any]] = {}
@@ -139,12 +190,16 @@ def collect_rows(report: Dict[str, Any], editable: bool) -> Dict[str, Any]:
                 if _is_junk_note(detail):
                     continue
                 _, text_preview = _row_texts(entry, paragraph)
-                if text_preview and text_preview.strip() and similar_ratio(detail, text_preview) > 0.88:
+                if is_echo_of_text(detail, text_preview):
                     continue
             source, text = _row_texts(entry, paragraph)
+            row_id = _flag_id({**flag, "batch_index": entry.get("index")})
             decision = flag.get("decision")
+            if decision is None and read_ids and row_id in read_ids:
+                # read-marker overlay: side-file only, never written into the report
+                decision = {"action": "read"}
             row = {
-                "id": _flag_id({**flag, "batch_index": entry.get("index")}),
+                "id": row_id,
                 "batch_index": entry.get("index"),
                 "chapter_id": int(chapter_id or 0),
                 "chapter_name": entry.get("chapter_name") or "",
@@ -158,6 +213,14 @@ def collect_rows(report: Dict[str, Any], editable: bool) -> Dict[str, Any]:
                 "history_count": len(flag.get("decision_history") or []) + (1 if decision else 0),
                 "editable": editable,
             }
+            if paragraph is None and stage == "done":
+                # batch-level rows (annotations, structural flags): carry every
+                # paragraph so the GUI offers direct in-place text editing
+                row["paragraphs"] = [
+                    {"index": item.get("index"), "source": item.get("source") or "", "text": item.get("text") or ""}
+                    for item in (entry.get("items") or [])
+                    if isinstance(item, dict)
+                ]
             chapter["rows"].append(row)
             is_annotation = row["type"] == "annotation"
             if not is_annotation:
@@ -177,32 +240,27 @@ def collect_rows(report: Dict[str, Any], editable: bool) -> Dict[str, Any]:
 
 def build_review_response(data_root: Path, book_id: str, language: str) -> Dict[str, Any]:
     """GET payload: flags grouped by chapter, ensemble reports read-only."""
-    authorial_path, ensemble_path = report_files(data_root, book_id, language)
-    if authorial_path is not None:
-        try:
-            report = json.loads(authorial_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            raise ReviewError(500, f"report unreadable ({exc}) — use the .bak copy in the same folder")
-        payload = collect_rows(report, editable=True)
-        payload["report_path"] = str(authorial_path)
-        return payload
-    if ensemble_path is not None:
-        try:
-            report = json.loads(ensemble_path.read_text(encoding="utf-8"))
-        except Exception:
-            report = {"mode": "ensemble"}
+    report_path, report_mode = current_report(data_root, book_id, language)
+    if report_path is None:
+        return {
+            "mode": None,
+            "language": language,
+            "open_flags": 0,
+            "total_flags": 0,
+            "chapters": [],
+            "report_path": None,
+            "hint": "No report for this target language yet — run an authorial translation first.",
+        }
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ReviewError(500, f"report unreadable ({exc}) — use the .bak copy in the same folder")
+    if report_mode == "ensemble":
         payload = collect_rows({"mode": "ensemble", "batches": report.get("batches") or []}, editable=False)
-        payload["report_path"] = str(ensemble_path)
-        return payload
-    return {
-        "mode": None,
-        "language": language,
-        "open_flags": 0,
-        "total_flags": 0,
-        "chapters": [],
-        "report_path": None,
-        "hint": "No report for this target language yet — run an authorial translation first.",
-    }
+    else:
+        payload = collect_rows(report, editable=True, read_ids=load_read_marks(data_root, book_id, language))
+    payload["report_path"] = str(report_path)
+    return payload
 
 
 def _find_flag(
@@ -265,6 +323,8 @@ async def retranslate_batch(
     similarity_stop: float,
     ratio_min: float,
     ratio_max: float,
+    structured: bool = True,
+    check_mode: str = "essential",
 ) -> Dict[str, Any]:
     """Re-run draft → refine → check for ONE corrupted batch (same chain).
 
@@ -288,18 +348,12 @@ async def retranslate_batch(
     # ---- draft -------------------------------------------------------------
     draft_client = LlmClient(LlmProfile(**draft_profile))
     try:
-        response = await draft_client.chat(
+        text, notes, _usage = await call_structured(
+            draft_client,
             draft_messages(source_block, language, book, previous_text),
-            temperature=DRAFT_TEMPERATURE,
+            DRAFT_TEMPERATURE,
+            structured=structured,
         )
-        raw = (response.content or "").strip()
-        if not raw:
-            raise LlmError("empty draft")
-        text, notes, _marker = clean_model_prose(raw)
-        if not text.strip():
-            raise LlmError("draft produced no prose before ANMERKUNGEN")
-        if is_placeholder_prose(text):
-            raise LlmError("draft answered with a placeholder instead of prose")
     finally:
         try:
             await draft_client.aclose()
@@ -346,18 +400,12 @@ async def retranslate_batch(
             }
             for round_no in range(1, refine_rounds + 1):
                 try:
-                    response = await refiner_client.chat(
+                    refined, note_lines, _usage = await call_structured(
+                        refiner_client,
                         refine_messages(para_source, previous_text, item["text"], language, book),
-                        temperature=REFINE_TEMPERATURE,
+                        REFINE_TEMPERATURE,
+                        structured=structured,
                     )
-                    raw = (response.content or "").strip()
-                    if not raw:
-                        raise LlmError("empty refinement")
-                    refined, note_lines, _marker = clean_model_prose(raw)
-                    if not refined.strip():
-                        raise LlmError("refinement produced no prose")
-                    if is_placeholder_prose(refined):
-                        raise LlmError("refinement answered with a placeholder instead of prose")
                 except Exception as exc:
                     await _unload(refiner_profile)
                     item["error"] = str(exc)
@@ -388,11 +436,20 @@ async def retranslate_batch(
         await _unload(refiner_profile)
 
     # ---- check -------------------------------------------------------------
+    # essential: keine Scores, keine Checker-Calls — nur der Katastrophenfall
+    # (fehlender deutscher Text) wird geflaggt. strict: das alte Scoring.
     for item in items:
         en_text = item["source"] or ""
         de_text = item["text"] or ""
         ratio = char_ratio(de_text, en_text)
         item["length_ratio"] = ratio
+        if check_mode == "essential":
+            if not de_text.strip() or is_placeholder_prose(de_text):
+                _review_note(
+                    reviewed, "fidelity", item["index"],
+                    "deutscher Text fehlt (nicht übersetzt oder Platzhalter)",
+                )
+            continue
         flag = length_flag(ratio, ratio_min, ratio_max)
         if flag:
             _review_note(reviewed, "length", item["index"], flag)
@@ -433,6 +490,56 @@ async def retranslate_batch(
     }
 
 
+def fix_paragraph(
+    data_root: Path,
+    book_id: str,
+    language: str,
+    book_title: str,
+    batch_index: int,
+    paragraph: int,
+    text: str,
+) -> Dict[str, Any]:
+    """Direct in-place German text edit from the review GUI (annotation rows):
+
+    replaces one item's text and re-persists every output. Lock while a
+    translation runs (the writer re-persists continuously)."""
+    report_path, report_mode = current_report(data_root, book_id, language)
+    if report_path is None:
+        raise ReviewError(404, f"no report for language {language}")
+    if report_mode == "ensemble":
+        raise ReviewError(400, "the latest report for this language is an ensemble report")
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ReviewError(500, f"report unreadable ({exc}) — restore the .bak first")
+    if report.get("mode") != "authorial":
+        raise ReviewError(400, "text edits need an authorial report")
+    entries = report.get("batches") or []
+    entry = next((e for e in entries if isinstance(e, dict) and e.get("index") == batch_index), None)
+    if entry is None:
+        raise ReviewError(404, f"batch index {batch_index} not in report")
+    if entry.get("stage") != "done":
+        raise ReviewError(409, f"batch {batch_index} is at stage '{entry.get('stage')}' — editing needs stage 'done'")
+    items = entry.get("items") or []
+    if not 0 <= int(paragraph) < len(items):
+        raise ReviewError(400, f"paragraph {paragraph} outside the batch ({len(items)} items)")
+    new_text = (text or "").strip()
+    if not new_text:
+        raise ReviewError(400, "text required")
+    items[int(paragraph)]["text"] = new_text
+    item_notes = items[int(paragraph)].setdefault("notes", [])
+    item_notes.append("manuell korrigiert (Review-GUI)")
+
+    shutil.copyfile(report_path, report_path.with_suffix(".json.bak"))
+    writer = AuthorialWriter(report_path.parent)
+    meta = {key: value for key, value in report.items() if key not in ("chapters", "batches")}
+    _restore_writer(writer, report)
+    writer.persist(meta, book_title or "")
+    payload = collect_rows(writer.as_report(meta), editable=True, read_ids=load_read_marks(data_root, book_id, language))
+    payload["edited_paragraph"] = {"batch_index": batch_index, "paragraph": int(paragraph)}
+    return payload
+
+
 def apply_decision(
     data_root: Path,
     book_id: str,
@@ -448,17 +555,17 @@ def apply_decision(
     """Write one decision into the report, fixed also into every output file."""
     if action not in ACTIONS:
         raise ReviewError(400, f"action must be one of {ACTIONS}")
-    authorial_path, ensemble_path = report_files(data_root, book_id, language)
-    if authorial_path is None:
-        raise ReviewError(404, f"no authorial report for language {language}")
-    if ensemble_path is not None:
+    report_path, report_mode = current_report(data_root, book_id, language)
+    if report_path is None:
+        raise ReviewError(404, f"no report for language {language}")
+    if report_mode == "ensemble":
         raise ReviewError(
             400,
             "the latest report for this language is an ensemble report — decisions are authorial-only",
         )
-    outdir = authorial_path.parent
+    outdir = report_path.parent
     try:
-        report = json.loads(authorial_path.read_text(encoding="utf-8"))
+        report = json.loads(report_path.read_text(encoding="utf-8"))
     except Exception as exc:
         raise ReviewError(
             500,
@@ -503,12 +610,12 @@ def apply_decision(
     flag["decision"] = decision
 
     # corruption guard: copy the report before the first write (cheap, always)
-    shutil.copyfile(authorial_path, authorial_path.with_suffix(".json.bak"))
+    shutil.copyfile(report_path, report_path.with_suffix(".json.bak"))
 
     writer = AuthorialWriter(outdir)
     meta = {key: value for key, value in report.items() if key not in ("chapters", "batches")}
     _restore_writer(writer, report)
     writer.persist(meta, book_title or "")
-    payload = collect_rows(writer.as_report(meta), editable=True)
+    payload = collect_rows(writer.as_report(meta), editable=True, read_ids=load_read_marks(data_root, book_id, language))
     payload["decided"] = decision
     return payload

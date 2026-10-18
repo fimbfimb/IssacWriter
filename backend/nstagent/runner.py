@@ -319,6 +319,22 @@ class BookRunner:
         lang = book.get("language", "en")
         outline = book["outline"]
         chapters_plan = sorted(outline["chapters"], key=lambda c: c["id"])
+        if book.get("refined_descriptions_source"):
+            # read-only swap of chapter descriptions for the ACTIVE refined briefs;
+            # book.json is never written — chapters without briefs keep the original
+            from ..refine.outline_engine import apply_refined_outline_descriptions
+
+            chapters_plan = apply_refined_outline_descriptions(
+                chapters_plan, self.store.root / self.book_id / "outline_refined"
+            )
+            refined_count = sum(1 for c in chapters_plan if c.get("outline_refined_version"))
+            if refined_count:
+                await self._emit(
+                    {
+                        "type": "outline_refine_output",
+                        "lines": [f"[writer-source] {refined_count}/{len(chapters_plan)} chapter briefs from outline_refined/ (active versions)"],
+                    }
+                )
         story_contract = self._story_contract(book)
         codex_text = codex_context(book.get("codex") or {})
         outline_json = outline_to_prompt_json(chapters_plan)

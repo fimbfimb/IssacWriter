@@ -153,6 +153,42 @@ def _parse_judge_decision(raw: str, candidate_count: int) -> Dict[str, Any]:
     return {"winner": 1, "reason": ""}  # judge failed → default to first valid candidate
 
 
+async def signal_call(
+    emit: Callable[[Dict[str, Any]], Awaitable[None]],
+    role: str,
+    detail: str,
+    call: Callable[[], Awaitable[Any]],
+) -> Any:
+    """Lifecycle wrapper for ONE LLM call: emits llm_call start/done/error and
+    returns the call result. Used by all engines so the UI can show that a
+    model is working between stage events."""
+    await emit({"type": "llm_call", "phase": "start", "role": role, "detail": detail})
+    began = time.time()
+    try:
+        result = await call()
+    except Exception as exc:
+        await emit(
+            {
+                "type": "llm_call",
+                "phase": "error",
+                "role": role,
+                "detail": detail,
+                "elapsed_s": round(time.time() - began, 1),
+            }
+        )
+        raise
+    await emit(
+        {
+            "type": "llm_call",
+            "phase": "done",
+            "role": role,
+            "detail": detail,
+            "elapsed_s": round(time.time() - began, 1),
+        }
+    )
+    return result
+
+
 async def unload_ollama_profile(profile: Dict[str, Any]) -> None:
     """Equivalent of `ollama stop <model>`: free the model from VRAM immediately."""
     base = (profile.get("base_url") or "").strip().rstrip("/")
@@ -293,9 +329,14 @@ async def run_ensemble_translation(
                 raise TranslationStopped()
             client = LlmClient(LlmProfile(**cand))
             try:
-                response = await client.chat(
-                    candidate_messages(source_block, language, book),
-                    temperature=float(cand.get("temperature", 0.7) or 0.7),
+                response = await signal_call(
+                    emit,
+                    cand_name,
+                    f"Block {index + 1}/{len(batches)} (Kapitel {batch['chapter_id'] + 1})",
+                    lambda: client.chat(
+                        candidate_messages(source_block, language, book),
+                        temperature=float(cand.get("temperature", 0.7) or 0.7),
+                    ),
                 )
                 text = (response.content or "").strip()
                 if not text:
@@ -338,10 +379,15 @@ async def run_ensemble_translation(
                 writer.persist({**meta, "interrupted": True})
                 raise TranslationStopped()
             try:
-                response = await judge_client.chat(
-                    judge_messages(source_block, results, language, book),
-                    temperature=0.2,
-                    max_output_tokens=1200,
+                response = await signal_call(
+                    emit,
+                    (judge_profile or {}).get("name") or "Judge",
+                    f"Block {index + 1}/{len(batches)} (Kapitel {batch['chapter_id'] + 1})",
+                    lambda: judge_client.chat(
+                        judge_messages(source_block, results, language, book),
+                        temperature=0.2,
+                        max_output_tokens=1200,
+                    ),
                 )
                 decision = _parse_judge_decision(response.content or "", len(results))
                 usage = response.usage.to_dict() if response.usage else {}

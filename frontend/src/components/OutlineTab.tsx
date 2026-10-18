@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
 import type { Book, OutlineChapter } from "../types";
 import LiveStreamBox from "./LiveStreamBox";
+import OutlineRefineCard from "./OutlineRefineCard";
 
 export default function OutlineTab({
   book,
@@ -317,6 +318,8 @@ export default function OutlineTab({
               </div>
             )}
           </div>
+
+          <OutlineRefineCard book={book} events={events} refreshBook={refreshBook} showToast={showToast} />
         </>
       )}
     </div>

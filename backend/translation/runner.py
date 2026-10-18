@@ -98,12 +98,28 @@ class TranslationRunner:
         self._stderr_tail: deque = deque(maxlen=30)
         self._emit: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
         self.outdir: Optional[Path] = None
+        self.source_mode: str = "original"
+        self.refined_used: List[int] = []
+        self.refined_fallback: List[int] = []
+        self.activity: Optional[Dict[str, Any]] = None
+        self.last_activity: Optional[float] = None
 
     def bind_emit(self, emit: Callable[[Dict[str, Any]], Awaitable[None]]) -> None:
         """Merge translation events into the shared book event stream (SSE/log)."""
         self._emit = emit
 
     async def _fire(self, event: Dict[str, Any]) -> None:
+        self.last_activity = time.time()
+        kind = str(event.get("type") or "")
+        if kind == "llm_call":
+            if event.get("phase") == "start":
+                self.activity = {
+                    "role": str(event.get("role") or "?"),
+                    "detail": str(event.get("detail") or ""),
+                    "since": time.time(),
+                }
+            else:
+                self.activity = None
         if self._emit is not None:
             try:
                 await self._emit(event)
@@ -152,6 +168,19 @@ class TranslationRunner:
                 line = line.rstrip(" ·")
         elif kind == "translation_output":
             line = " · ".join(str(part) for part in event.get("lines") or [])
+        elif kind == "translate_progress":
+            line = (
+                f"¶ {event.get('paragraph')}/{event.get('paragraphs_total')} verfeinert"
+                f" · {event.get('rounds') or 0} Runde(n)"
+                + (" · Frühstopp" if event.get("stopped_early") else "")
+            )
+        elif kind == "llm_call":
+            if event.get("phase") == "start":
+                line = f"… {event.get('role')} arbeitet: {event.get('detail')}"
+            elif event.get("phase") == "done":
+                line = f"✔ {event.get('role')} fertig ({event.get('elapsed_s')}s) — {event.get('detail')}"
+            else:
+                line = f"✘ {event.get('role')} Fehler nach {event.get('elapsed_s')}s — {event.get('detail')}"
         elif kind == "translation_done":
             line = f"{'done' if event.get('status') == 'done' else 'stopped/interrupted'} — {event.get('output_file') or 'no output file'}"
             if event.get("review_flags") is not None:
@@ -184,6 +213,11 @@ class TranslationRunner:
             "finished_at": self.finished_at,
             "interrupted": self.interrupted,
             "task_alive": bool(self._task is not None and not self._task.done()),
+            "source_mode": self.source_mode,
+            "refined_used": list(self.refined_used),
+            "refined_fallback": list(self.refined_fallback),
+            "activity": self.activity,
+            "last_activity": self.last_activity,
             "tool": tool_status(),
         }
 
@@ -293,6 +327,22 @@ class TranslationRunner:
             chapters = [c for c in chapters if int(c["id"]) in wanted]
         if not chapters:
             raise RuntimeError("no written chapters yet — write a chapter first")
+        self.source_mode = "original"
+        self.refined_used: List[int] = []
+        self.refined_fallback: List[int] = []
+        if bool(config.get("use_refined")):
+            # read-only swap: refined/active version per chapter; explicit —
+            # a run must never silently translate originals while the author
+            # believes the refined text is being used
+            chapters, self.refined_used, self.refined_fallback = apply_refined_source(
+                chapters, self.store.root / self.book_id / "refined"
+            )
+            if not self.refined_used:
+                raise RuntimeError(
+                    "use_refined is on but no chapter has a refined version yet — "
+                    "run the Refine tab first (or turn the option off)"
+                )
+            self.source_mode = "refined"
         if mode == "tool" and not resume:
             build_translation_source(chapters, source)
 
@@ -356,6 +406,20 @@ class TranslationRunner:
                 (config.get("checker") or {}).get("name") or (config.get("checker") or {}).get("model")
             )
         await self._fire(started_event)
+        if self.source_mode == "refined":
+            await self._fire(
+                {
+                    "type": "translation_output",
+                    "lines": [
+                        f"[quelle] {len(self.refined_used)} Kapitel aus refined/ (Aktivversionen)"
+                        + (
+                            f" · Original-Fallback (kein refined): {self.refined_fallback}"
+                            if self.refined_fallback
+                            else ""
+                        )
+                    ],
+                }
+            )
         if mode == "ensemble":
             await self._job_ensemble(config, judge, chapters, resume)
             return
@@ -550,6 +614,8 @@ class TranslationRunner:
                 outdir=self.outdir or (self.store.root / self.book_id / "translations"),
                 book=self.store.load_book(self.book_id),
                 resume=resume,
+                structured=bool(config.get("structured", True)),
+                check_mode=(str(config.get("check_mode") or "essential").lower() if str(config.get("check_mode") or "essential").lower() in ("essential", "strict") else "essential"),
                 emit=self._fire,
                 should_stop=lambda: self._stop_requested,
             )
@@ -725,3 +791,36 @@ class TranslationRegistry:
         if book_id not in self._runners:
             self._runners[book_id] = TranslationRunner(book_id, self.store)
         return self._runners[book_id]
+
+
+def apply_refined_source(
+    chapters: List[Dict[str, Any]], refined_dir: Path
+) -> Tuple[List[Dict[str, Any]], List[int], List[int]]:
+    """Swap chapter content for the ACTIVE refined version (read-only).
+
+    Chapters without any refined version keep their original content and are
+    reported as fallback so the run never silently mixes sources. Returns
+    (chapters_with_refined_content, refined_used_ids, fallback_ids).
+    The original chapters/ store is never written.
+    """
+    from ..refine.engine import active_version, read_version
+
+    used: List[int] = []
+    fallback: List[int] = []
+    result: List[Dict[str, Any]] = []
+    for chapter in chapters:
+        cid = int(chapter["id"])
+        version = active_version(refined_dir, cid)
+        payload = read_version(refined_dir, cid, version) if version is not None else None
+        content = str((payload or {}).get("content") or "")
+        if content.strip():
+            replaced = dict(chapter)
+            replaced["content"] = content
+            replaced["refined_from_version"] = int(version or 0)
+            replaced["refined_words"] = len(content.split())
+            result.append(replaced)
+            used.append(cid)
+        else:
+            result.append(chapter)
+            fallback.append(cid)
+    return result, used, fallback

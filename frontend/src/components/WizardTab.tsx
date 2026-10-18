@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api";
 import type { Book, Profile, WizardState, WizardStepKind, WizardStepConfig } from "../types";
 import WizardProgressBoard, { wizardStepLabel, overallPercent } from "./WizardProgressBoard";
@@ -33,26 +33,38 @@ function emptyCodexRows(): { characters: CodexMinRow[]; settings: CodexMinRow[] 
   };
 }
 
-function ProfileSelect({
+function SingleProfileChips({
   value,
   onChange,
   profiles,
-  placeholder,
+  emptyLabel,
 }: {
   value: string;
   onChange: (id: string) => void;
   profiles: Profile[];
-  placeholder: string;
+  emptyLabel: string;
 }) {
+  // Klick-Auswahl wie bei den Kandidaten: an = gewählt, nochmal klick = abgewählt
   return (
-    <select value={value} onChange={(event) => onChange(event.target.value)}>
-      <option value="">{placeholder}</option>
-      {profiles.map((profile) => (
-        <option key={profile.id} value={profile.id}>
-          {profile.name || profile.model} ({profile.model})
-        </option>
-      ))}
-    </select>
+    <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+      {profiles.map((profile) => {
+        const active = value === profile.id;
+        return (
+          <button
+            key={profile.id}
+            type="button"
+            className={`chip${active ? " status-done" : ""} btn-ghost`}
+            style={{ padding: "4px 10px", borderColor: active ? "var(--good)" : undefined }}
+            onClick={() => onChange(active ? "" : profile.id)}
+            title={`${profile.name || profile.model} · ${profile.model}`}
+          >
+            {active ? "✔ " : ""}
+            {profile.name || profile.model}
+          </button>
+        );
+      })}
+      {!value ? <span className="muted" style={{ fontSize: 11.5, alignSelf: "center" }}>{emptyLabel}</span> : null}
+    </div>
   );
 }
 
@@ -110,6 +122,7 @@ function WizardConfigScreen({
   const [storyPrompt, setStoryPrompt] = useState(book.story_prompt || "");
   const [targetWords, setTargetWords] = useState<number>(book.target_words || 10000);
   const [genreNotes, setGenreNotes] = useState(book.genre_notes || "");
+  const [attachExisting, setAttachExisting] = useState(false);
   const [characters, setCharacters] = useState<CodexMinRow[]>(
     (book.codex?.characters ?? []).length
       ? book.codex!.characters.map((row) => ({
@@ -154,8 +167,10 @@ function WizardConfigScreen({
     );
 
   const validate = (): string | null => {
-    if (!title.trim()) return "Bitte einen Buchtitel angeben.";
-    if (!storyPrompt.trim()) return "Bitte die Buchidee (Story-Prompt) angeben.";
+    if (!attachExisting) {
+      if (!title.trim()) return "Bitte einen Buchtitel angeben.";
+      if (!storyPrompt.trim()) return "Bitte die Buchidee (Story-Prompt) angeben.";
+    }
     const enabled = steps.filter((row) => row.enabled);
     if (!enabled.length) return "Bitte mindestens einen Schritt aktivieren.";
     for (const row of steps) {
@@ -191,33 +206,32 @@ function WizardConfigScreen({
       return;
     }
     setError(null);
-    const codexCharacterRows = characters
-      .filter((row) => row.name.trim())
-      .map((row) => ({
-        name: row.name.trim(),
-        aliases: row.aliases.split(",").map((alias) => alias.trim()).filter(Boolean),
-        description: row.description.trim(),
-        role: row.role.trim() || "character",
-        color: "",
-      }));
-    const codexSettingRows = settings
-      .filter((row) => row.name.trim())
-      .map((row) => ({
-        name: row.name.trim(),
-        aliases: row.aliases.split(",").map((alias) => alias.trim()).filter(Boolean),
-        description: row.description.trim(),
-        role: "",
-        color: "",
-      }));
+    const codexRow = (rows: CodexMinRow[]) =>
+      rows
+        .filter((row) => row.name.trim())
+        .map((row) => ({
+          name: row.name.trim(),
+          aliases: row.aliases.split(",").map((alias) => alias.trim()).filter(Boolean),
+          description: row.description.trim(),
+          role: row.role.trim() || "character",
+          color: "",
+        }));
+    const codex_min = { characters: codexRow(characters), settings: codexRow(settings.map((row) => (row.role = row.role || "", row))), lore: [] };
     const payload = {
-      book: {
-        title: title.trim(),
-        story_prompt: storyPrompt.trim(),
-        language: "en", // Wizard-Bücher sind immer englisch — der Übersettings-Toggle steuert nur Schritte 5/6
-        target_words: Math.max(100, Number(targetWords) || 10000),
-        genre_notes: genreNotes.trim(),
-        codex_min: { characters: codexCharacterRows, settings: codexSettingRows, lore: [] },
-      },
+      book_id: attachExisting ? book.id : null,
+      book: attachExisting
+        ? // the book's own title/idea/codex are used — nothing gets copied
+          { title: book.title || "", story_prompt: book.story_prompt || "", language: "en",
+            target_words: book.target_words || 0, genre_notes: "",
+            codex_min: { characters: [], settings: [], lore: [] } }
+        : {
+            title: title.trim(),
+            story_prompt: storyPrompt.trim(),
+            language: "en", // Wizard-Bücher sind immer englisch — der Übersettings-Toggle steuert nur Schritte 5/6
+            target_words: Math.max(100, Number(targetWords) || 10000),
+            genre_notes: genreNotes.trim(),
+            codex_min: { characters: codexRow(characters), settings: codexRow(settings), lore: [] },
+          },
       steps: steps.map((row) => ({
         ...row,
         planner_profile_id: row.planner_profile_id || null,
@@ -239,29 +253,33 @@ function WizardConfigScreen({
   return (
     <div>
       <div className="card">
-        <strong style={{ fontSize: 15 }}>🧙 Buch-Wizard — Grundlagen</strong>
+        <strong style={{ fontSize: 15 }}>🧙 Buch-Wizard</strong>
         <p className="inline-note">
           Das Buch wird <b>immer auf Englisch</b> geplant und geschrieben. Danach wahlweise automatisch ins Deutsche
-          übersetzt (Schritte 5 + 6). Der Wizard erzeugt ein <b>NEUES Buch</b> aus diesen Eingaben und orchestriert
-          danach die 6 Schritte (Outline → Kappenverfeinerung → Schreiben → Textverfeinerung →
-          [Übersetzung → Deutsch-Verfeinerung]). Vorgefüllt mit den Daten des aktuellen Buchs.
+          übersetzt (Schritte 5 + 6): CHAIN-Kette Outline → Kappenverfeinerung → Schreiben → Textverfeinerung →
+          [Übersetzung → Deutsch-Verfeinerung].
         </p>
-        <div className="form-row">
-          <div className="form-col">
-            <label>Buchtitel (Pflicht)</label>
-            <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Titel des Buchs" />
-          </div>
-          <div className="form-col">
-            <label>Ziel-Wortzahl</label>
-            <input
-              type="number"
-              min={300}
-              step={100}
-              value={targetWords}
-              onChange={(event) => setTargetWords(Number(event.target.value))}
-            />
-          </div>
-        </div>
+        <label
+          style={{
+            display: "flex", gap: 9, alignItems: "center", margin: "2px 0 12px",
+            border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", background: "var(--bg-soft)",
+            color: "var(--text)", cursor: "pointer",
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={attachExisting}
+            onChange={(event) => setAttachExisting(event.target.checked)}
+          />
+          <span>
+            <strong>An DIES Buch hängen</strong>
+            <span className="muted" style={{ display: "block", fontSize: 12 }}>
+              an = der Wizard läuft für das aktuelle Buch (Titel, Idee und Codex bleiben wie sie sind — Resume/Retry ohne
+              neue Kopien). aus = es wird ein NEUES Buch aus den Eingaben unten angelegt.
+            </span>
+          </span>
+        </label>
+
         <label
           style={{
             display: "flex", gap: 9, alignItems: "center", margin: "2px 0 12px",
@@ -282,6 +300,46 @@ function WizardConfigScreen({
             </span>
           </span>
         </label>
+
+        {!attachExisting ? (
+          <>
+            <div className="form-row">
+              <div className="form-col">
+                <label>Buchtitel (Pflicht)</label>
+                <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Titel des Buchs" />
+              </div>
+              <div className="form-col">
+                <label>Ziel-Wortzahl</label>
+                <input
+                  type="number"
+                  min={300}
+                  step={100}
+                  value={targetWords}
+                  onChange={(event) => setTargetWords(Number(event.target.value))}
+                />
+              </div>
+            </div>
+            <div className="form-col" style={{ marginBottom: 12 }}>
+              <label>Idee / Story-Prompt (Pflicht)</label>
+              <textarea
+                value={storyPrompt}
+                onChange={(event) => setStoryPrompt(event.target.value)}
+                rows={4}
+                placeholder="Premise, Ton, Umfang, besondere Anforderungen — so detailliert wie möglich"
+              />
+            </div>
+            <div className="form-col" style={{ marginBottom: 12 }}>
+              <label>Genre- und Stil-Vorgaben (optional)</label>
+              <textarea value={genreNotes} onChange={(event) => setGenreNotes(event.target.value)} rows={2} />
+            </div>
+          </>
+        ) : (
+          <div className="inline-note" style={{ marginBottom: 12, color: "var(--text)" }}>
+            Bindet den Wizard an <b>{book.title}</b> — es wird nichts neu angelegt und nichts kopiert. Bereits vorhandene
+            Outline/Kapitel nutzt der Wizard als Fortsetzungsstand (Schritt 1 friert lediglich, Schritt 3 schreibt nur
+            fehlende Kapitel).
+          </div>
+        )}
         <div className="form-col" style={{ marginBottom: 12 }}>
           <label>Idee / Story-Prompt (Pflicht)</label>
           <textarea
@@ -383,16 +441,16 @@ function WizardConfigScreen({
 
               <div className="form-row">
                 {row.kind === "outline" ? (
-                  <div className="form-col">
-                    <label>Planner-Profil*</label>
-                    <ProfileSelect value={row.planner_profile_id ?? ""} onChange={(id) => patchStep(row.step, { planner_profile_id: id })} profiles={profiles} placeholder="Profil wählen" />
+                  <div className="form-col" style={{ minWidth: 320 }}>
+                    <label>Planner-Profil* (anklicken)</label>
+                    <SingleProfileChips value={row.planner_profile_id ?? ""} onChange={(id) => patchStep(row.step, { planner_profile_id: id })} profiles={profiles} emptyLabel="Profil wählen" />
                   </div>
                 ) : null}
                 {row.kind === "write" ? (
                   <>
-                    <div className="form-col">
-                      <label>Writer-Profil*</label>
-                      <ProfileSelect value={row.writer_profile_id ?? ""} onChange={(id) => patchStep(row.step, { writer_profile_id: id })} profiles={profiles} placeholder="Profil wählen" />
+                    <div className="form-col" style={{ minWidth: 320 }}>
+                      <label>Writer-Profil* (anklicken)</label>
+                      <SingleProfileChips value={row.writer_profile_id ?? ""} onChange={(id) => patchStep(row.step, { writer_profile_id: id })} profiles={profiles} emptyLabel="Profil wählen" />
                     </div>
                     <div className="form-col">
                       <label>Laufmodus</label>
@@ -402,17 +460,17 @@ function WizardConfigScreen({
                 ) : null}
                 {row.kind === "translate" ? (
                   <>
-                    <div className="form-col">
-                      <label>Entwurfs-Profil*</label>
-                      <ProfileSelect value={row.draft_profile_id ?? ""} onChange={(id) => patchStep(row.step, { draft_profile_id: id })} profiles={profiles} placeholder="Profil wählen" />
+                    <div className="form-col" style={{ minWidth: 260 }}>
+                      <label>Entwurfs-Profil* (anklicken)</label>
+                      <SingleProfileChips value={row.draft_profile_id ?? ""} onChange={(id) => patchStep(row.step, { draft_profile_id: id })} profiles={profiles} emptyLabel="Profil wählen" />
                     </div>
-                    <div className="form-col">
-                      <label>Verfeinerungs-Profil*</label>
-                      <ProfileSelect value={row.refiner_profile_id ?? ""} onChange={(id) => patchStep(row.step, { refiner_profile_id: id })} profiles={profiles} placeholder="Profil wählen" />
+                    <div className="form-col" style={{ minWidth: 260 }}>
+                      <label>Verfeinerungs-Profil* (anklicken)</label>
+                      <SingleProfileChips value={row.refiner_profile_id ?? ""} onChange={(id) => patchStep(row.step, { refiner_profile_id: id })} profiles={profiles} emptyLabel="Profil wählen" />
                     </div>
-                    <div className="form-col">
+                    <div className="form-col" style={{ minWidth: 260 }}>
                       <label>Checker (optional)</label>
-                      <ProfileSelect value={row.checker_profile_id ?? ""} onChange={(id) => patchStep(row.step, { checker_profile_id: id })} profiles={profiles} placeholder="kein Checker" />
+                      <SingleProfileChips value={row.checker_profile_id ?? ""} onChange={(id) => patchStep(row.step, { checker_profile_id: id })} profiles={profiles} emptyLabel="kein Checker" />
                     </div>
                     <div className="form-col" style={{ maxWidth: 130 }}>
                       <label>Zielsprache</label>
@@ -431,9 +489,9 @@ function WizardConfigScreen({
                   </div>
                 ) : null}
                 {row.kind !== "outline" && row.kind !== "write" && row.kind !== "translate" ? (
-                  <div className="form-col" style={{ maxWidth: 220 }}>
-                    <label>Judge (optional)</label>
-                    <ProfileSelect value={row.judge_profile_id ?? ""} onChange={(id) => patchStep(row.step, { judge_profile_id: id })} profiles={profiles} placeholder="kein Judge — Kandidat 1 gewinnt" />
+                  <div className="form-col" style={{ minWidth: 260 }}>
+                    <label>Judge (optional, anklicken)</label>
+                    <SingleProfileChips value={row.judge_profile_id ?? ""} onChange={(id) => patchStep(row.step, { judge_profile_id: id })} profiles={profiles} emptyLabel="kein Judge — Kandidat 1 gewinnt" />
                   </div>
                 ) : null}
               </div>
@@ -509,6 +567,153 @@ function WizardConfigScreen({
         <span className="muted" style={{ fontSize: 12 }}>
           legt ein neues Buch an; Profile mit fehlendem Model-Eintrag werden beim Start geprüft.
         </span>
+      </div>
+    </div>
+  );
+}
+
+function WizardConfigEditor({
+  wizard,
+  profiles,
+  busy,
+  onSave,
+}: {
+  wizard: WizardState;
+  profiles: Profile[];
+  busy: boolean;
+  onSave: (patch: { steps: Record<string, any>[] }) => void;
+}) {
+  const [draft, setDraft] = useState<Record<number, Partial<WizardStepConfig>>>({});
+  const lastConfigRef = useRef<string>("");
+
+  const configJson = JSON.stringify(wizard.config.steps);
+  useEffect(() => {
+    // reset the draft only when the SAVED config actually changed (own save or
+    // another patch) — normal wizard polling must never wipe user edits
+    if (lastConfigRef.current && lastConfigRef.current !== configJson) setDraft({});
+    lastConfigRef.current = configJson;
+  }, [configJson]);
+
+  const merged = (step: number): Partial<WizardStepConfig> => ({
+    ...(wizard.config.steps.find((row) => row.step === step) ?? { step, kind: STEP_KINDS[step - 1] } as WizardStepConfig),
+    ...(draft[step] ?? {}),
+  });
+
+  const setField = (step: number, key: string, value: any) =>
+    setDraft((prev) => ({ ...prev, [step]: { ...(prev[step] ?? {}), [key]: value } }));
+
+  const stepRows = wizard.config.steps;
+  const dirtySteps = stepRows
+    .filter((row) => Object.keys(draft[row.step] ?? {}).length > 0)
+    .map((row) => row.step);
+
+  const save = () => {
+    const patchSteps = dirtySteps.map((step) => ({ step, ...draft[step] }));
+    if (!patchSteps.length) return;
+    onSave({ steps: patchSteps }); // draft is dropped by the config-change effect once persisted
+  };
+
+  const singleField = (
+    step: number,
+    key: keyof WizardStepConfig,
+    label: string,
+  ) => (
+    <div className="form-col" style={{ minWidth: 320 }}>
+      <label>{label}</label>
+      <SingleProfileChips
+        value={String((merged(step) as any)[key] ?? "")}
+        onChange={(id) => setField(step, key as string, id)}
+        profiles={profiles}
+        emptyLabel="kein Profil gesetzt"
+      />
+    </div>
+  );
+
+  const candidateFields = (step: number) => {
+    const row = merged(step);
+    return (
+      <>
+        <div className="form-col" style={{ minWidth: 320 }}>
+          <label>Kandidaten (Schritt läuft über alle, Judge gewinnt)</label>
+          <CandidatePicker
+            ids={(row as any).candidate_profile_ids ?? []}
+            onChange={(ids) => setField(step, "candidate_profile_ids", ids)}
+            profiles={profiles}
+          />
+        </div>
+        {singleField(step, "judge_profile_id" as keyof WizardStepConfig, "Judge")}
+      </>
+    );
+  };
+
+  const fieldsFor = (step: number, kind: WizardStepKind) => {
+    switch (kind) {
+      case "outline":
+        return <>{singleField(step, "planner_profile_id", "Planner-Profil")}</>;
+      case "outline_refine":
+        return <>{candidateFields(step)}</>;
+      case "write":
+        return <>{singleField(step, "writer_profile_id", "Writer-Profil")}</>;
+      case "text_refine":
+        return <>{candidateFields(step)}</>;
+      case "translate":
+        return (
+          <>
+            {singleField(step, "draft_profile_id", "Draft-Profil")}
+            {singleField(step, "refiner_profile_id", "Refiner-Profil")}
+            {singleField(step, "checker_profile_id", "Checker-Profil")}
+          </>
+        );
+      case "translate_refine":
+        return <>{candidateFields(step)}</>;
+      default:
+        return null;
+    }
+  };
+
+  return (
+    <div className="card">
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+        <div>
+          <strong style={{ fontSize: 15 }}>⚙ Konfiguration ändern — LLMs pro Schritt</strong>
+          <div className="inline-note">
+            Wirkt beim (Neu-)Start des Schritts — nie mitten im Schritt. Für bereits <b>erledigte</b> Schritte: nach
+            dem Speichern oben in der Schrittzeile ↻ <b>Retry</b> drücken (neue Versionen landen zusätzlich, alte
+            bleiben). Pausieren/Stoppen vor dem Speichern, solange der Wizard läuft.
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          {dirtySteps.length > 0 && (
+            <button onClick={() => setDraft({})} disabled={busy}>
+              Verwerfen
+            </button>
+          )}
+          <button className="btn-primary" disabled={busy || dirtySteps.length === 0} onClick={save}>
+            {dirtySteps.length ? `Speichern (Schritt ${dirtySteps.join(", ")})` : "Keine Änderungen"}
+          </button>
+        </div>
+      </div>
+      <div className="wizard-steps" style={{ marginTop: 8 }}>
+        {stepRows.map((row) => {
+          const stepStatus = wizard.steps_state.find((state) => state.step === row.step)?.status;
+          const dirty = (draft[row.step] ?? {}) as Record<string, unknown>;
+          const isDirty = Object.keys(dirty).length > 0;
+          return (
+            <div key={row.step} className="form-row" style={{ alignItems: "baseline" }}>
+              <div className="form-col" style={{ minWidth: 190 }}>
+                <strong style={{ fontSize: 12.5 }}>
+                  S{row.step} · {wizardStepLabel(row.step)}
+                  {isDirty ? " *" : ""}
+                </strong>
+                <span className="muted" style={{ fontSize: 11 }}>
+                  {row.kind}
+                  {stepStatus === "done" ? " · erledigt — Retry nötig" : ""}
+                </span>
+              </div>
+              {fieldsFor(row.step, row.kind)}
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -601,6 +806,12 @@ export default function WizardTab({
         onTogglePauseBetweenSteps={() => {
           control(() => api.wizardPatchConfig(book.id, { pause_between_steps: !wizard.config.pause_between_steps }));
         }}
+      />
+      <WizardConfigEditor
+        wizard={wizard}
+        profiles={profiles}
+        busy={busy}
+        onSave={(patch) => control(() => api.wizardPatchConfig(book.id, patch))}
       />
       <div className="card">
         <WizardLivePane book={{ id: book.id, title: book.title }} state={wizard} events={events} />

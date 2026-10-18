@@ -36,6 +36,11 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 export const api = {
   health: () => request<{ ok: boolean }>("/api/health"),
   settings: () => request<Record<string, any>>("/api/settings"),
+  saveOllamaKey: (key: string) =>
+    request<{ ollama_cloud_api_key_set: boolean }>("/api/settings", {
+      method: "PUT",
+      body: JSON.stringify({ ollama_cloud_api_key: key }),
+    }),
 
   listProfiles: () => request<{ profiles: Profile[] }>("/api/profiles"),
   createProfile: (data: Partial<Profile>) =>
@@ -285,6 +290,23 @@ export const api = {
     request<{ outputs: { path: string; size: number; modified: number }[] }>(
       `/api/books/${id}/translate/outputs`,
     ),
+  translateEpub: async (id: string, language: string) => {
+    const response = await fetch(
+      `/api/books/${id}/export/translation/epub${language ? `?language=${encodeURIComponent(language)}` : ""}`,
+    );
+    if (!response.ok) {
+      let detail = response.statusText;
+      try {
+        const body = await response.json();
+        if (body?.detail) detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+      } catch {}
+      throw new Error(`${response.status}: ${detail}`);
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get("Content-Disposition") ?? "";
+    const match = /filename=([^;]+)/.exec(disposition);
+    return { blob, filename: match?.[1]?.trim() ?? "uebersetzung.epub", source: response.headers.get("X-Epub-Source") };
+  },
   translateFile: (id: string, path: string) =>
     request<{ path: string; content: string }>(
       `/api/books/${id}/translate/file?path=${encodeURIComponent(path)}`,
@@ -580,6 +602,12 @@ export const api = {
     request<{ path: string; content: string }>(
       `/api/books/${id}/german-refine/file?path=${encodeURIComponent(path)}${language ? `&language=${encodeURIComponent(language)}` : ""}`,
     ),
+
+  llmModels: (data: { profile_id?: string | null; base_url?: string | null; api_key?: string | null }) =>
+    request<{ models: string[] }>("/api/llm/models", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
 };
 
 export function openEventStream(bookId: string, onEvent: (event: any) => void): () => void {

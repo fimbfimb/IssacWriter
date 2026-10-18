@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 from openai import AsyncOpenAI
 
+from .app_settings import get_ollama_cloud_key, is_ollama_cloud_base
+
 _INLINE_THINKING = re.compile(r"<think(?:ing)?>(?:.|\n)*?</think(?:ing)?>", re.IGNORECASE)
 
 
@@ -313,15 +315,46 @@ def _thinking_params_rejected(exc: Exception, sdk_params: Dict[str, Any], extra_
 class LlmClient:
     def __init__(self, profile: LlmProfile):
         self.profile = profile
+        self.profile_is_cloud = is_ollama_cloud_base(profile.base_url)
+        # the profile's OWN key, kept pristine: while a global key exists it is
+        # the active one, the moment it is cleared this one takes over again
+        self._own_api_key = (profile.api_key or "").strip()
         self._client = AsyncOpenAI(
             base_url=profile.base_url or None,
-            api_key=profile.api_key or "sk-no-key-required",
+            api_key=self._resolve_api_key(),
             max_retries=0,
             timeout=httpx.Timeout(900.0, read=900.0, write=600.0, connect=30.0),
         )
         self._http = httpx.AsyncClient(
             timeout=httpx.Timeout(900.0, read=900.0, write=600.0, connect=30.0)
         )
+
+    def _resolve_api_key(self) -> str:
+        """Effective key for this client.
+
+        Ollama Cloud is governed by the ONE global key, read fresh from the
+        settings file; a profile key never gets a chance to go stale while a
+        global key exists. Without a global key the profile's own key applies,
+        then the harmless placeholder for key-less local servers.
+        """
+        if self.profile_is_cloud:
+            key = get_ollama_cloud_key().strip()
+            if key:
+                self.profile.api_key = key
+                return key
+            return self._own_api_key or "sk-no-key-required"
+        return (self.profile.api_key or "").strip() or "sk-no-key-required"
+
+    def _apply_cloud_key(self) -> str:
+        """Resolve the effective key and push it into the SDK client.
+
+        The openai SDK derives the Authorization header from ``api_key`` on
+        EVERY request it makes, so re-running this at the top of each chat()
+        / list_models() call ships a settings-file key swap to the very next
+        request — mid-run included, on any openai 1.x/2.x version."""
+        key = self._resolve_api_key()
+        self._client.api_key = key
+        return key
 
     async def aclose(self) -> None:
         """Release the pooled HTTP connections (translation ensemble loop)."""
@@ -342,6 +375,11 @@ class LlmClient:
         override = (self.profile.extra_params or {}).get("use_native")
         if override is not None:
             return bool(override)
+        base = (self.profile.base_url or "").lower()
+        if "ollama.com" in base or "ollama.ai" in base:
+            # Ollama CLOUD is OpenAI-compatible only — the native /api/chat
+            # path has no Authorization header and returns 401 there
+            return False
         return self._is_ollama() and (self.profile.thinking or "default") != "default"
 
     def _native_endpoint(self) -> str:
@@ -361,6 +399,9 @@ class LlmClient:
     ) -> LlmResponse:
         """Talk to Ollama's native /api/chat (supports the think knob reliably)."""
         body = native_request_body(self.profile, messages, tools, temperature, max_output_tokens)
+        headers = None
+        if self.profile.api_key:
+            headers = {"Authorization": f"Bearer {self.profile.api_key}"}
         content_parts: List[str] = []
         reasoning_parts: List[str] = []
         tool_calls: List[ToolCall] = []
@@ -369,7 +410,7 @@ class LlmClient:
         usage.price_out_per_m = self.profile.price_out_per_m
         usage.estimated = True
         finish_reason = "stop"
-        async with self._http.stream("POST", self._native_endpoint(), json=body) as response:
+        async with self._http.stream("POST", self._native_endpoint(), json=body, headers=headers) as response:
             if response.status_code != 200:
                 raw = (await response.aread()).decode("utf-8", "ignore")
                 raise LlmError(f"Ollama native error {response.status_code}: {raw[:300]}", status_code=response.status_code)
@@ -433,6 +474,10 @@ class LlmClient:
         max_output_tokens: Optional[int] = None,
         on_delta: Optional[Any] = None,
     ) -> LlmResponse:
+        # fresh key resolution on every call — the native path (and anything
+        # reading profile.api_key / client.api_key) never lags behind a
+        # settings change
+        self._apply_cloud_key()
         if self._use_native():
             return await self._ollama_native_chat(
                 messages, tools, tool_choice, temperature, max_output_tokens, on_delta
@@ -499,6 +544,7 @@ class LlmClient:
         )
 
     async def list_models(self) -> List[str]:
+        self._apply_cloud_key()
         try:
             page = await self._client.models.list()
         except Exception as exc:

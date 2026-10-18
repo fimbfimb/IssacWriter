@@ -31,6 +31,11 @@ from ..export.layout import (
     visual_extract_messages,
 )
 from ..export.epub import build_epub, slugify_filename
+from ..llm.app_settings import (
+    get_ollama_cloud_key,
+    is_ollama_cloud_base,
+    set_ollama_cloud_key,
+)
 from ..llm.provider import LlmClient, LlmError, LlmProfile
 from ..llm.profiles import ProfileStore
 from ..llm.provider import extract_json
@@ -49,6 +54,11 @@ from ..store.project import BookStore
 from ..wizard import state as wizard_state
 from ..wizard.engine import WizardRegistry
 from ..translation.authorial import AuthorialWriter
+from ..translation.german_export import (
+    align_illustrations_for_translation,
+    collect_german_chapters,
+    language_code,
+)
 from ..translation.review import (
     ReviewError,
     add_read_marks as review_add_read_marks,
@@ -245,6 +255,7 @@ class WizardCreateIn(BaseModel):
     book: WizardBookIn
     steps: List[WizardStepIn] = Field(default_factory=list)
     pause_between_steps: bool = False
+    book_id: Optional[str] = None  # attach to an EXISTING book instead of creating one
 
 
 class WizardRetryIn(BaseModel):
@@ -275,6 +286,16 @@ class GermanRefineSelectIn(BaseModel):
     chapter_id: int
     version: int
     language: Optional[str] = None
+
+
+class LlmModelListIn(BaseModel):
+    profile_id: Optional[str] = None
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+
+
+class AppSettingsIn(BaseModel):
+    ollama_cloud_api_key: Optional[str] = None
 
 
 class SequelPrepareIn(BaseModel):
@@ -359,7 +380,20 @@ def create_app() -> FastAPI:
                 "max_turns": MAX_TURNS_PER_CHAPTER,
             },
             "data_root": str(DATA_ROOT),
+            "ollama_cloud_api_key_set": bool(get_ollama_cloud_key().strip()),
         }
+
+    @app.put("/api/settings")
+    def put_settings(payload: AppSettingsIn):
+        """Global provider settings — currently the ONE Ollama Cloud API key.
+
+        Sent non-empty → the key is stored and applies to every Ollama Cloud
+        request from now on (read fresh per call). Sent empty → the key is
+        cleared. Omitted → nothing changes."""
+        if payload.ollama_cloud_api_key is None:
+            return {"ollama_cloud_api_key_set": bool(get_ollama_cloud_key().strip())}
+        set_ollama_cloud_key(payload.ollama_cloud_api_key)
+        return {"ollama_cloud_api_key_set": bool(get_ollama_cloud_key().strip())}
 
     @app.get("/api/profiles")
     def list_profiles():
@@ -397,9 +431,71 @@ def create_app() -> FastAPI:
             raise HTTPException(502, f"connection failed: {exc}")
         return {"models": models}
 
+    @app.post("/api/llm/models")
+    async def llm_model_list(payload: LlmModelListIn):
+        """List a provider's models WITHOUT a saved profile (inline api key +
+        base url) — e.g. for Ollama Cloud. An existing profile id reuses its
+        stored key; a typed key wins over the stored one."""
+        profile = {}
+        if payload.profile_id:
+            profile = dict(profile_or_404(payload.profile_id))
+        base_url = (payload.base_url or "").strip() or str(profile.get("base_url") or "").strip()
+        if not base_url:
+            raise HTTPException(400, "base_url required (or a saved profile to read it from)")
+        typed_key = (payload.api_key or "").strip()
+        api_key = typed_key if typed_key and typed_key != "***" else str(profile.get("api_key") or "")
+        if not api_key and is_ollama_cloud_base(base_url):
+            # no per-profile/typed key — fall back to the ONE global Ollama
+            # Cloud key, freshly read (the LlmClient provider re-reads it per
+            # request anyway)
+            api_key = get_ollama_cloud_key().strip()
+        client = LlmClient(
+            LlmProfile(name="model-list", base_url=base_url, api_key=api_key, model="none")
+        )
+        try:
+            models = await client.list_models()
+        except LlmError as exc:
+            raise HTTPException(502, f"connection failed: {exc}")
+        return {"models": models}
+
+    def wizard_summary(book_id: str) -> Optional[Dict[str, Any]]:
+        """Compact wizard progress for the Library cards.
+
+        Built through live_view() so the server-restart semantics (running →
+        paused) and the progress overlay match the Wizard tab exactly."""
+        try:
+            view = wizards.get(book_id).live_view()
+        except Exception:
+            return None
+        if not view:
+            return None
+        rows = [
+            {
+                "step": row.get("step"),
+                "kind": row.get("kind"),
+                "status": row.get("status"),
+                "progress": row.get("progress"),
+            }
+            for row in view.get("steps_state") or []
+            if isinstance(row, dict)
+        ]
+        done = sum(1 for row in rows if row["status"] in ("done", "skipped"))
+        current = next((row for row in rows if row["step"] == view.get("current_step")), None)
+        return {
+            "status": view.get("status"),
+            "current_step": view.get("current_step"),
+            "current_kind": (current or {}).get("kind"),
+            "steps_done": done,
+            "steps_total": len(rows),
+            "steps": rows,
+        }
+
     @app.get("/api/books")
     def list_books():
-        return {"books": store.list_books()}
+        rows = store.list_books()
+        for row in rows:
+            row["wizard"] = wizard_summary(row["id"])
+        return {"books": rows}
 
     @app.post("/api/books")
     def create_book(payload: BookIn):
@@ -1505,19 +1601,24 @@ def create_app() -> FastAPI:
             steps.append(row)
         return steps
 
-    def _wizard_validate(payload: WizardCreateIn) -> None:
+    def _wizard_validate(payload: WizardCreateIn) -> List[Dict[str, Any]]:
         """Config validation before a wizard book is created (edge cases 6/7).
 
         Wizard books are ALWAYS written in English; the language of the book
         is not configurable — steps 5/6 decide whether a translation pass runs
-        afterwards."""
+        afterwards. When payload.book_id is set, the wizard attaches to that
+        EXISTING book (its title/idea/codex stay the book's own)."""
         book_in = payload.book
-        if not (book_in.title or "").strip():
-            raise HTTPException(400, "title required")
-        if not (book_in.story_prompt or "").strip():
-            raise HTTPException(400, "story_prompt (the book idea) required")
+        if not payload.book_id:
+            if not (book_in.title or "").strip():
+                raise HTTPException(400, "title required")
+            if not (book_in.story_prompt or "").strip():
+                raise HTTPException(400, "story_prompt (the book idea) required")
         target_words = int(book_in.target_words or 0)
-        if target_words <= 0:
+        if payload.book_id:
+            if target_words < 0:
+                raise HTTPException(400, "target_words must be positive")
+        elif target_words <= 0:
             raise HTTPException(400, "target_words must be positive")
         steps = _wizard_steps_from_payload(payload.steps or [])
         for row in steps:
@@ -1583,15 +1684,47 @@ def create_app() -> FastAPI:
 
     @app.post("/api/wizard")
     async def wizard_create(payload: WizardCreateIn):
+        if payload.book_id:
+            book = get_book_or_404(payload.book_id)
+            if wizard_state.load_state(DATA_ROOT / str(book["id"])) is not None:
+                raise HTTPException(
+                    409,
+                    "this book already has a wizard — resume it in the wizard tab, "
+                    "or delete the wizard first to set it up anew",
+                )
         steps = _wizard_validate(payload)
         book_in = payload.book
+        by_kind = {row["kind"]: row for row in steps}
+
+        if payload.book_id:
+            # Attach mode: run the wizard on this EXISTING book — no new book,
+            # no copied data; title/idea/codex stay the book's own.
+            wizard_runner = wizards.get(book["id"])
+            config = {
+                "book": {
+                    "title": book["title"],
+                    "story_prompt": book["story_prompt"],
+                    "language": book["language"],
+                    "target_words": book["target_words"],
+                    "genre_notes": book["genre_notes"] or "",
+                    "codex_min": book.get("codex") or {},
+                    "attached": True,
+                },
+                "steps": steps,
+                "pause_between_steps": payload.pause_between_steps,
+            }
+            try:
+                await wizard_runner.attach(config)
+            except Exception as exc:
+                raise HTTPException(400, f"wizard start failed: {exc}")
+            return {"book": book, "wizard_state": wizard_runner.live_view()}
+
         codex_payload = book_in.codex_min or CodexIn()
         codex = {
             "characters": [row.model_dump() for row in codex_payload.characters],
             "settings": [row.model_dump() for row in codex_payload.settings],
             "lore": [row.model_dump() for row in codex_payload.lore],
         }
-        by_kind = {row["kind"]: row for row in steps}
         book = store.create_book(
             (book_in.title or "").strip(),
             book_in.story_prompt,
@@ -1818,6 +1951,40 @@ def create_app() -> FastAPI:
         )
         filename = slugify_filename(book.get("title") or "book")
         headers = {"Content-Disposition": f"attachment; filename={filename}"}
+        if warnings:
+            headers["X-Epub-Warnings"] = "; ".join(warnings)[:600]
+        return Response(content=data, media_type="application/epub+zip", headers=headers)
+
+    @app.get("/api/books/{book_id}/export/translation/epub")
+    def export_translation_epub(book_id: str, language: str = ""):
+        """EPUB of the finished TRANSLATED (German-refined or plain German) book.
+
+        Priority: german_refined active versions → authorial/plain German →
+        ensemble winners. Illustration anchors are clamped onto the translated
+        chapters' paragraph ranges (best effort), cover + images come along."""
+        book = get_book_or_404(book_id)
+        settings = book.get("translation_settings") or {}
+        resolved = (language or "").strip()
+        if isinstance(settings, dict) and not resolved:
+            resolved = str(settings.get("target_language") or "").strip()
+        resolved = resolved or "German"
+        chapters, source = collect_german_chapters(DATA_ROOT / str(book_id), resolved)
+        if not chapters:
+            raise HTTPException(400, f"no translated ({resolved}) chapters yet — finish the translation first")
+        layout = load_layout(DATA_ROOT, book_id)
+        data, warnings = build_epub(
+            title=book.get("title") or "Untitled Book",
+            chapters=chapters,
+            language=language_code(resolved),
+            author="",
+            layout=align_illustrations_for_translation(layout, chapters),
+            load_image=_book_image_loader(book_id),
+        )
+        filename = slugify_filename(f"{book.get('title') or 'book'} {resolved}")
+        headers = {
+            "Content-Disposition": f"attachment; filename={filename}",
+            "X-Epub-Source": source,
+        }
         if warnings:
             headers["X-Epub-Warnings"] = "; ".join(warnings)[:600]
         return Response(content=data, media_type="application/epub+zip", headers=headers)

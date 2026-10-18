@@ -82,6 +82,22 @@ export type Book = {
   last_error?: string;
 };
 
+export type WizardBookStep = {
+  step: number;
+  kind: string;
+  status: string;
+  progress: { done: number; total: number | null } | null;
+};
+
+export type WizardBookSummary = {
+  status: string;
+  current_step: number | null;
+  current_kind: string | null;
+  steps_done: number;
+  steps_total: number;
+  steps: WizardBookStep[];
+};
+
 export type BookSummary = {
   id: string;
   title: string;
@@ -92,6 +108,7 @@ export type BookSummary = {
   updated: string;
   chapters_written: number;
   words_written: number;
+  wizard?: WizardBookSummary | null;
 };
 
 export type RunnerStatus = {

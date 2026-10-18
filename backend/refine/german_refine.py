@@ -417,7 +417,6 @@ class GermanRefineRunner:
             self.model = ", ".join(str(c.get("model")) for c in candidates)
         else:
             base = dict(config.get("profile") or (candidates[0] if candidates else {}))
-            candidates = []
             if not base.get("model"):
                 raise RuntimeError("german refine needs a profile with a model configured")
             self.profile_name = str(base.get("name") or base.get("model"))
@@ -498,7 +497,17 @@ class GermanRefineRunner:
             draft_profile = dict(candidates[0])
             refiner_profile = None
         else:
-            base_profile = dict(config.get("profile") or {})
+            # MUST mirror start(): with a single candidate the wizard does not
+            # hand a "profile" key — fall back to the candidate's own dict.
+            # A missing profile here would build LlmProfile(**{}) whose empty
+            # base_url makes the openai SDK default to http://127.0.0.1:8000/v1 —
+            # every draft call then dies with
+            # "Error code: 405 - {'detail': 'Method Not Allowed'}" against the
+            # StoryForge server itself (Eitelkeit step 6, 10/10 blocks failed).
+            base_profile = dict(
+                config.get("profile")
+                or (candidates[0] if candidates else {})
+            )
             draft_profile = base_profile
             refiner_profile = base_profile
         await self._fire(

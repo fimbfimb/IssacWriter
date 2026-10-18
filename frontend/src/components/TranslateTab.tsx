@@ -119,6 +119,7 @@ export default function TranslateTab({
   const [tStatus, setTStatus] = useState<Record<string, any> | null>(book.translation ?? null);
   const [outputs, setOutputs] = useState<{ path: string; size: number; modified: number }[]>([]);
   const [viewContent, setViewContent] = useState<{ path: string; content: string } | null>(null);
+  const [epubBusy, setEpubBusy] = useState(false);
   const [liveGerman, setLiveGerman] = useState<string | null>(null);
   const [chapterProgress, setChapterProgress] = useState<{
     chapters: {
@@ -400,6 +401,24 @@ export default function TranslateTab({
       URL.revokeObjectURL(url);
     } catch (err: any) {
       showToast(err.message);
+    }
+  };
+
+  const exportEpub = async () => {
+    setEpubBusy(true);
+    try {
+      const { blob, filename } = await api.translateEpub(book.id, targetLanguage);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+      showToast("Translation EPUB downloaded");
+    } catch (err: any) {
+      showToast(err.message);
+    } finally {
+      setEpubBusy(false);
     }
   };
 
@@ -781,6 +800,18 @@ tools\\bbm-venv\\Scripts\\pip install -e tools/bilingual_book_maker`}
           running={busy}
         />
       </div>
+      </div>
+
+      <div className="card" style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+        <strong>Export</strong>
+        <span className="muted" style={{ fontSize: 12, flex: 1, minWidth: 280 }}>
+          EPUB aus den fertigen Übersetzungskapiteln — Reihenfolge: German-Refined (aktive Versionen) →
+          Authorial (<code>chapters_de</code>) → Ensemble-Gewinntexte. Cover + Illustrationen kommen mit.
+        </span>
+        <button className="btn-primary" onClick={exportEpub} disabled={epubBusy}>
+          {epubBusy ? "EPUB wird gebaut…" : `↓ EPUB (${targetLanguage || "German"})`}
+        </button>
+        {germanPath && <button onClick={() => download(germanPath)}>↓ book_german.txt</button>}
       </div>
 
       {(chapterProgress?.chapters?.length ?? 0) > 0 && (

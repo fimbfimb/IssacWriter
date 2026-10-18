@@ -321,6 +321,7 @@ class ChapterWriter:
     ) -> Optional[Dict[str, Any]]:
         distance = min(abs(word_count - min_words), abs(word_count - max_words)) / max(1, target)
         if full_rejection is None:
+            self._compact_rejection(messages, assistant_index, word_count, min_words, max_words)
             return {
                 "assistant_index": assistant_index,
                 "count": word_count,
@@ -328,13 +329,29 @@ class ChapterWriter:
             }
         improvement = (full_rejection["distance"] - distance) / max(0.000001, full_rejection["distance"])
         if improvement >= ADAPTIVE_LENGTH_MIN_IMPROVEMENT:
-            self._compact_rejection(messages, full_rejection["assistant_index"])
+            self._compact_rejection(
+                messages, full_rejection["assistant_index"], full_rejection["count"], min_words, max_words
+            )
             return {"assistant_index": assistant_index, "count": word_count, "distance": distance}
-        self._compact_rejection(messages, assistant_index)
+        self._compact_rejection(messages, assistant_index, word_count, min_words, max_words)
         return full_rejection
 
     @staticmethod
-    def _compact_rejection(messages: List[Dict[str, Any]], assistant_index: int) -> None:
+    def _compact_rejection(
+        messages: List[Dict[str, Any]],
+        assistant_index: int,
+        word_count: int,
+        min_words: int,
+        max_words: int,
+    ) -> None:
+        """Compress a rejected write call in the history — it stays ONLY as a
+        schema example, never as a copy-template for garbage.
+
+        DANGER the bug fix guards against: the model mimics its own last write
+        arguments. The compacted call must keep the REAL schema (chapter_id,
+        title, content hint) so a copied shape still produces a valid write —
+        `null` placeholders here taught a model to send `{"chapter_id": null}`
+        80 times in a row (The Twilight Border failure)."""
         if assistant_index >= len(messages):
             return
         assistant_msg = messages[assistant_index]
@@ -347,13 +364,26 @@ class ChapterWriter:
         write_call = next((tc for tc in tool_calls if _call_name(tc) == "write"), None)
         if write_call is None:
             return
-        args = parse_tool_arguments(write_call.get("arguments", "{}"))
+        # the agent's history stores arguments under `function.arguments` (OpenAI
+        # shape); a top-level `arguments` key never exists there — reading the
+        # wrong field produced {chapter_id: null, title: null, ...} compactions
+        function_block = write_call.get("function") or {}
+        raw_args = write_call.get("arguments", "{}")
+        if raw_args is None or raw_args == "{}":
+            raw_args = function_block.get("arguments", "{}")
+        args = parse_tool_arguments(raw_args)
         content = str(args.get("content", ""))
         compact_args = {
             "chapter_id": args.get("chapter_id"),
             "title": args.get("title"),
             "word_count": count_words(content),
-            "note": "rejected draft; its text was removed from history, word count retained",
+            "note": (
+                f"REJECTED for length ({count_words(content)} words; accepted range "
+                f"{min_words}-{max_words}). The draft text was removed from the history to save "
+                "context — DO NOT resubmit it. Submit ONE new write call in exactly this shape: "
+                '{"chapter_id": <chapter number>, "title": "<chapter title>", '
+                '"content": "<the COMPLETE new chapter text, within the accepted range>"}.'
+            ),
         }
         compact_json = json.dumps(compact_args, ensure_ascii=False)
         if write_call.get("function") is not None:
@@ -368,7 +398,10 @@ class ChapterWriter:
                 except Exception:
                     tool_content = {}
                 tool_content["compacted"] = True
-                tool_content["note"] = "rejected draft text removed from history; word count retained"
+                tool_content["note"] = (
+                    "rejected draft text removed from history; its word count is in the write "
+                    "call's note above"
+                )
                 msg["content"] = json.dumps(tool_content, ensure_ascii=False)
                 break
 
@@ -523,11 +556,21 @@ class ChapterWriter:
             }, {}
         requested = args.get("chapter_id")
         if not isinstance(requested, int) or requested != ch_id:
-            return {"ok": False, "error": f"chapter_id must be {ch_id}"}, {}
+            return {
+                "ok": False,
+                "error": f"chapter_id must be {ch_id} — ONE write call, then: "
+                + json.dumps({"chapter_id": ch_id, "title": "chapter title", "content": "COMPLETE chapter text"}),
+            }, {}
         title = str(args.get("title") or "").strip()
         content = str(args.get("content") or "").strip()
         if not content:
-            return {"ok": False, "error": "content must be non-empty"}, {}
+            return {
+                "ok": False,
+                "error": "content MUST be the complete chapter text (plain prose, not notes) — "
+                + json.dumps(
+                    {"chapter_id": ch_id, "title": "chapter title", "content": "<complete chapter text>"}
+                ),
+            }, {}
         if current_corrected:
             return {
                 "ok": False,

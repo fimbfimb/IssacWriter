@@ -92,6 +92,13 @@ export default function WizardProgressBoard({
         <strong style={{ minWidth: 46, textAlign: "right" }}>{overall}%</strong>
       </div>
 
+      {(status === "paused" || status === "error" || status === "stopped") ? (
+        <div className="inline-note" style={{ color: "var(--text)" }}>
+          Der Wizard läuft <b>an diesem Buch</b> weiter — <b>Resume</b> setzt fort, <b>Retry</b> wiederholt nur den
+          fehlgeschlagenen Schritt. Es wird kein neues Buch angelegt.
+        </div>
+      ) : null}
+
       <div className="wizard-steps" style={{ marginTop: 8 }}>
         {state.steps_state.map((row) => {
           const percent = stepPercent(row);

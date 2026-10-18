@@ -1,6 +1,49 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
-import type { BookSummary } from "../types";
+import type { BookSummary, WizardBookSummary, WizardBookStep } from "../types";
+
+const WIZARD_STEP_LABELS: Record<string, string> = {
+  outline: "Outline",
+  outline_refine: "Outline refinement",
+  write: "Write chapters",
+  text_refine: "Text refinement",
+  translate: "Translate",
+  translate_refine: "Translation refinement",
+};
+
+// reuse the runner-status chip colors for wizard states
+const WIZARD_CHIP_CLASS: Record<string, string> = {
+  running: "status-writing",
+  pausing: "status-paused",
+  paused: "status-paused",
+  stopping: "status-stopped",
+  stopped: "status-stopped",
+  done: "status-done",
+  error: "status-error",
+};
+
+function stepPercent(step: WizardBookStep): number {
+  if (step.status === "done" || step.status === "skipped") return 100;
+  const progress = step.progress;
+  if (progress?.total && progress.total > 0)
+    return Math.min(100, Math.round(((progress.done || 0) / progress.total) * 100));
+  return step.status === "running" ? 4 : 0;
+}
+
+// average step completion across all non-skipped steps (same doctrine as the Wizard tab board)
+function wizardOverallPercent(wizard: WizardBookSummary): number {
+  const active = wizard.steps.filter((s) => s.status !== "skipped");
+  const rows = active.length ? active : wizard.steps;
+  if (!rows.length) return 0;
+  return Math.round(rows.reduce((sum, s) => sum + stepPercent(s), 0) / rows.length);
+}
+
+function progressText(step: WizardBookStep | undefined): string {
+  if (!step) return "";
+  const progress = step.progress;
+  if (progress?.total != null) return `${progress.done || 0}/${progress.total}`;
+  return `${progress?.done ?? 0}`;
+}
 
 export default function Library({ onOpen, showToast }: { onOpen: (id: string) => void; showToast: (m: string) => void }) {
   const [books, setBooks] = useState<BookSummary[]>([]);
@@ -18,6 +61,9 @@ export default function Library({ onOpen, showToast }: { onOpen: (id: string) =>
 
   useEffect(() => {
     refresh();
+    // the wizard advances between polls — keep the cards' stage/step info live
+    const timer = window.setInterval(refresh, 5000);
+    return () => window.clearInterval(timer);
   }, []);
 
   const create = async () => {
@@ -61,29 +107,60 @@ export default function Library({ onOpen, showToast }: { onOpen: (id: string) =>
       </div>
 
       <div className="book-grid">
-        {books.map((book) => (
-          <div key={book.id} className="book-card" onClick={() => onOpen(book.id)}>
-            <h3>{book.title}</h3>
-            <div className="muted" style={{ fontSize: 12 }}>
-              {book.chapters_written} chapters · {book.words_written.toLocaleString()} /{" "}
-              {book.target_words.toLocaleString()} words · {book.language.toUpperCase()}
+        {books.map((book) => {
+          const wizard = book.wizard;
+          const current = wizard?.steps.find((s) => s.step === wizard.current_step);
+          const currentLabel = current ? WIZARD_STEP_LABELS[current.kind] ?? `Step ${current.step}` : null;
+          const overall = wizard ? wizardOverallPercent(wizard) : 0;
+          return (
+            <div key={book.id} className="book-card" onClick={() => onOpen(book.id)}>
+              <h3>{book.title}</h3>
+              <div className="muted" style={{ fontSize: 12 }}>
+                {book.chapters_written} chapters · {book.words_written.toLocaleString()} /{" "}
+                {book.target_words.toLocaleString()} words · {book.language.toUpperCase()}
+              </div>
+              <div className="progress-outer">
+                <div
+                  className="progress-inner"
+                  style={{
+                    width: `${Math.min(100, (book.words_written / Math.max(1, book.target_words)) * 100).toFixed(1)}%`,
+                  }}
+                />
+              </div>
+              {wizard ? (
+                <>
+                  <div className="muted" style={{ fontSize: 12, marginTop: 6, display: "flex", alignItems: "center", gap: 6 }}>
+                    <span>🧙 {wizard.steps_done}/{wizard.steps_total} steps</span>
+                    {current && current.status !== "done" && (
+                      <span style={{ color: "var(--accent)" }}>
+                        · {currentLabel}
+                        {current.status === "running" ? ` (${progressText(current)})` : ""}
+                      </span>
+                    )}
+                  </div>
+                  <div className="progress-outer" title={`Wizard ${overall}%`}>
+                    <div className="progress-inner" style={{ width: `${overall}%`, backgroundColor: "var(--accent)" }} />
+                  </div>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <span className={`chip status-idle ${WIZARD_CHIP_CLASS[wizard.status] ?? ""}`}>
+                      🧙 {wizard.status.replace("_", " ")}
+                    </span>
+                    <button className="btn-ghost btn-danger" onClick={(e) => remove(book.id, e)}>
+                      Delete
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span className={`chip status-${book.status}`}>{book.status.replace("_", " ")}</span>
+                  <button className="btn-ghost btn-danger" onClick={(e) => remove(book.id, e)}>
+                    Delete
+                  </button>
+                </div>
+              )}
             </div>
-            <div className="progress-outer">
-              <div
-                className="progress-inner"
-                style={{
-                  width: `${Math.min(100, (book.words_written / Math.max(1, book.target_words)) * 100).toFixed(1)}%`,
-                }}
-              />
-            </div>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <span className={`chip status-${book.status}`}>{book.status.replace("_", " ")}</span>
-              <button className="btn-ghost btn-danger" onClick={(e) => remove(book.id, e)}>
-                Delete
-              </button>
-            </div>
-          </div>
-        ))}
+          );
+        })}
         {books.length === 0 && (
           <div className="card muted">
             No books yet. Create your first book: give it a story prompt, pick a language and a target length,

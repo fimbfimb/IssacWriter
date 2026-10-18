@@ -22,7 +22,7 @@ export default function App() {
     <div className="app-shell">
       <div className="topbar">
         <h1 onClick={() => setBookId(null)}>
-          Story<span>Forge</span>
+          Isaac<span>Writer</span>
         </h1>
         <div className="muted">Narrative State Tracking Studio</div>
       </div>

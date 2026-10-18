@@ -74,8 +74,15 @@ class OutlineRefineRunner:
     def _append_log(self, event: Dict[str, Any]) -> None:
         outdir = self.outdir
         kind = str(event.get("type") or "")
-        if outdir is None or not kind.startswith("outline_refine_") and kind != "llm_call":
+        if outdir is None:
             return
+        if not (kind.startswith("outline_refine_") or kind in ("llm_call", "wizard_candidates")):
+            return
+        if kind == "wizard_candidates":
+            line = (
+                f"candidates {', '.join(event.get('candidates') or [])} → winner "
+                f"{event.get('winner') or '?'} ({event.get('unit') or ''})"
+            )
         if kind == "outline_refine_started":
             line = (
                 f"start — briefs · profile {event.get('profile') or '?'}"
@@ -150,10 +157,22 @@ class OutlineRefineRunner:
     async def start(self, config: Dict[str, Any]) -> None:
         if self._task is not None and not self._task.done():
             raise RuntimeError("outline refinement already in progress")
-        profile = dict(config.get("profile") or {})
+        candidates = [
+            dict(c)
+            for c in (config.get("candidates") or [])
+            if isinstance(c, dict) and c
+        ]
+        judge = dict(config.get("judge") or {}) if config.get("judge") else None
+        ensemble_active = len(candidates) >= 2
+        profile = dict(config.get("profile") or (candidates[0] if candidates else {}))
         if not profile:
             raise RuntimeError("outline refine needs an LLM profile")
-        if not profile.get("model"):
+        if ensemble_active:
+            if any(not c.get("model") for c in candidates):
+                raise RuntimeError("a candidate profile has no model configured")
+            if judge and not judge.get("model"):
+                raise RuntimeError("the judge profile has no model configured")
+        elif not profile.get("model"):
             raise RuntimeError("the outline refine profile has no model configured")
 
         book = self.store.load_book(self.book_id)
@@ -177,8 +196,15 @@ class OutlineRefineRunner:
         self.error = None
         self.interrupted = False
         self.language = str(config.get("language") or "English").strip() or "English"
-        self.profile_name = profile.get("name") or profile.get("model")
-        self.model = profile.get("model")
+        if ensemble_active:
+            self.profile_name = "candidates (" + " · ".join(
+                str(c.get("name") or c.get("model")) for c in candidates
+            ) + (f" + judge {judge.get('name') or judge.get('model')}" if judge else " (no judge)")
+            self.profile_name += ")"
+            self.model = ", ".join(str(c.get("model")) for c in candidates)
+        else:
+            self.profile_name = profile.get("name") or profile.get("model")
+            self.model = profile.get("model")
         self.batches_total = len(chapters_plan)
 
         book_dir = self.store.root / self.book_id
@@ -216,6 +242,8 @@ class OutlineRefineRunner:
         chapters_plan: list,
         resume: bool,
     ) -> None:
+        candidates = [dict(c) for c in (config.get("candidates") or []) if isinstance(c, dict) and c]
+        ensemble_active = len(candidates) >= 2
         await self._fire(
             {
                 "type": "outline_refine_started",
@@ -223,6 +251,13 @@ class OutlineRefineRunner:
                 "language": self.language,
                 "refine_rounds": int(config.get("refine_rounds") or 1),
                 "chapters": [int(c["id"]) for c in chapters_plan],
+                "candidates": [
+                    str(c.get("name") or c.get("model")) for c in candidates
+                ] if ensemble_active else None,
+                "judge": (
+                    (config.get("judge") or {}).get("name") or (config.get("judge") or {}).get("model")
+                ) if (config.get("judge") and ensemble_active) else None,
+                "parallel_candidates": bool(config.get("parallel_candidates")) if ensemble_active else None,
             }
         )
         def _clamp_int(value: Any, default: float, lo: int, hi: int) -> int:
@@ -244,7 +279,7 @@ class OutlineRefineRunner:
                 book=book,
                 profile=profile,
                 language=self.language,
-                unload_after_call=bool(config.get("unload_after_call", True)),
+                unload_after_call=bool(config.get("unload_after_call", True)) if not ensemble_active or not config.get("parallel_candidates") else False,
                 refine_rounds=_clamp_int(config.get("refine_rounds"), DEFAULT_REFINE_ROUNDS, 1, 3),
                 similarity_stop=_clamp_float(config.get("similarity_stop"), DEFAULT_SIMILARITY_STOP, 0.5, 1.0),
                 context_prev=_clamp_int(config.get("context_prev"), DEFAULT_CONTEXT_PREV, 0, 50),
@@ -253,6 +288,9 @@ class OutlineRefineRunner:
                 refined_dir=self.refined_dir or (self.store.root / self.book_id / "outline_refined"),
                 resume=resume,
                 structured=bool(config.get("structured", True)),
+                candidates=candidates if ensemble_active else None,
+                judge=dict(config["judge"]) if (config.get("judge") and ensemble_active) else None,
+                parallel_candidates=bool(config.get("parallel_candidates")) and ensemble_active,
                 emit=self._fire,
                 should_stop=lambda: self._stop_requested,
             )

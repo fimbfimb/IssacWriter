@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -36,6 +37,8 @@ from ..llm.provider import extract_json
 from ..nstagent.prompts import CHAPTER_ANCHORS, MAX_CORRECT_PER_CHAPTER, MAX_READ, MAX_SEARCH, MAX_TURNS_PER_CHAPTER, SEARCH_MAX_HITS
 from ..nstagent.runner import RunnerRegistry
 from ..refine import engine as refine_engine
+from ..refine import german_refine as german_refine_engine
+from ..refine.german_refine import GermanRefineRegistry
 from ..refine.runner import RefineRegistry
 from ..refine import outline_engine
 from ..refine.outline_runner import OutlineRefineRegistry
@@ -43,6 +46,8 @@ from ..sequel import create_sequel_book, prepare_sequel
 from ..stats.mentions import build_stats, export_markdown, export_txt
 from ..store.codex import merge_extracted
 from ..store.project import BookStore
+from ..wizard import state as wizard_state
+from ..wizard.engine import WizardRegistry
 from ..translation.authorial import AuthorialWriter
 from ..translation.review import (
     ReviewError,
@@ -101,6 +106,7 @@ class CodexIn(BaseModel):
 class RunConfigIn(BaseModel):
     planner_profile_id: Optional[str] = None
     writer_profile_id: Optional[str] = None
+    only_outline: bool = False
 
 
 class ReviewIn(BaseModel):
@@ -205,6 +211,72 @@ class OutlineRefineSelectIn(BaseModel):
     version: int
 
 
+class WizardStepIn(BaseModel):
+    step: int
+    kind: str
+    enabled: bool = True
+    planner_profile_id: Optional[str] = None
+    writer_profile_id: Optional[str] = None
+    candidate_profile_ids: List[str] = Field(default_factory=list)
+    judge_profile_id: Optional[str] = None
+    parallel: bool = False
+    refine_rounds: Optional[int] = None
+    similarity_stop: Optional[float] = None
+    context_prev: Optional[int] = None
+    style_probe: Optional[str] = None
+    draft_temperature: Optional[float] = None
+    batch_words: Optional[int] = None
+    target_language: Optional[str] = None
+    draft_profile_id: Optional[str] = None
+    refiner_profile_id: Optional[str] = None
+    checker_profile_id: Optional[str] = None
+
+
+class WizardBookIn(BaseModel):
+    title: str
+    story_prompt: str
+    language: str = "en"
+    target_words: int = 10000
+    genre_notes: str = ""
+    codex_min: Optional[CodexIn] = None
+
+
+class WizardCreateIn(BaseModel):
+    book: WizardBookIn
+    steps: List[WizardStepIn] = Field(default_factory=list)
+    pause_between_steps: bool = False
+
+
+class WizardRetryIn(BaseModel):
+    step: int
+
+
+class WizardConfigPatchIn(BaseModel):
+    pause_between_steps: Optional[bool] = None
+    steps: List[WizardStepIn] = Field(default_factory=list)
+
+
+class GermanRefineIn(BaseModel):
+    language: str = "German"
+    profile_id: Optional[str] = None
+    candidate_profile_ids: List[str] = Field(default_factory=list)
+    judge_profile_id: Optional[str] = None
+    parallel_candidates: bool = False
+    unload_after_call: bool = True
+    resume: bool = False
+    batch_words: int = 0
+    refine_rounds: int = 2
+    similarity_stop: float = 0.97
+    structured: bool = True
+    style_probe: str = ""
+
+
+class GermanRefineSelectIn(BaseModel):
+    chapter_id: int
+    version: int
+    language: Optional[str] = None
+
+
 class SequelPrepareIn(BaseModel):
     idea: str
     planner_profile_id: Optional[str] = None
@@ -246,6 +318,16 @@ def create_app() -> FastAPI:
     translations = TranslationRegistry(store)
     refines = RefineRegistry(store)
     outline_refines = OutlineRefineRegistry(store)
+    german_refines = GermanRefineRegistry(store)
+    wizards = WizardRegistry(
+        store,
+        profiles,
+        runners,
+        translations,
+        refines,
+        outline_refines,
+        german_refines,
+    )
 
     def get_book_or_404(book_id: str) -> Dict[str, Any]:
         try:
@@ -619,6 +701,14 @@ def create_app() -> FastAPI:
         runner = runners.get(book_id)
         if runner._task is not None and not runner._task.done():
             raise HTTPException(409, f"runner busy in status {runner.status}")
+        if payload.only_outline:
+            # wizard outline-only mode: 4 planner stages → auto-freeze → done
+            planner = profile_or_404(payload.planner_profile_id or book.get("planner_profile_id"))
+            if planner is None:
+                raise HTTPException(400, "planner_profile_id required")
+            book["planner_profile_id"] = planner["id"]
+            await runner.start("outline", {"planner_profile": planner, "auto_freeze": True})
+            return {"status": runner._meta()}
         writer_profile = profile_or_404(payload.writer_profile_id or book.get("writer_profile_id"))
         if writer_profile is None:
             raise HTTPException(400, "writer_profile_id required")
@@ -1227,6 +1317,383 @@ def create_app() -> FastAPI:
         removed = outline_engine.reset_outline_refine_all(DATA_ROOT / str(book_id))
         return {"removed": removed}
 
+    # ------------------------------------------------------------ german refine
+
+    def _german_language(book_id: str) -> str:
+        book = get_book_or_404(book_id)
+        runner_meta = german_refines.get(book_id)._meta()
+        language = runner_meta.get("language")
+        if not language:
+            settings = book.get("translation_settings") or {}
+            if isinstance(settings, dict):
+                language = settings.get("target_language")
+        return language or "German"
+
+    @app.post("/api/books/{book_id}/german-refine")
+    async def german_refine_start(book_id: str, payload: GermanRefineIn):
+        get_book_or_404(book_id)
+        runner = german_refines.get(book_id)
+        candidates = []
+        seen: List[str] = []
+        for raw_id in payload.candidate_profile_ids:
+            if not raw_id or raw_id in seen:
+                continue
+            seen.append(raw_id)
+            candidates.append(dict(profile_or_404(raw_id)))
+        config: Dict[str, Any] = {
+            "language": payload.language,
+            "candidates": candidates,
+            "judge": dict(profile_or_404(payload.judge_profile_id)) if payload.judge_profile_id else None,
+            "parallel_candidates": payload.parallel_candidates,
+            "unload_after_call": payload.unload_after_call,
+            "resume": payload.resume,
+            "batch_words": payload.batch_words,
+            "refine_rounds": payload.refine_rounds,
+            "similarity_stop": payload.similarity_stop,
+            "structured": payload.structured,
+            "style_probe": payload.style_probe,
+        }
+        if not candidates:
+            config["profile"] = dict(profile_or_404(payload.profile_id)) if payload.profile_id else None
+        try:
+            await runner.start(config)
+        except RuntimeError as exc:
+            status = 409 if "already in progress" in str(exc) else 400
+            raise HTTPException(status, str(exc))
+        return {"status": runner._meta()}
+
+    @app.get("/api/books/{book_id}/german-refine/status")
+    def german_refine_status(book_id: str):
+        get_book_or_404(book_id)
+        return {"status": german_refines.get(book_id)._meta()}
+
+    @app.post("/api/books/{book_id}/german-refine/stop")
+    async def german_refine_stop(book_id: str):
+        get_book_or_404(book_id)
+        runner = german_refines.get(book_id)
+        runner.stop()
+        return {"status": runner._meta()}
+
+    @app.get("/api/books/{book_id}/german-refine/progress")
+    def german_refine_progress(book_id: str):
+        get_book_or_404(book_id)
+        status = german_refines.get(book_id)._meta()
+        language = status.get("language") or _german_language(book_id)
+        base = (DATA_ROOT / str(book_id) / "translations" / slugify_language(language)).resolve()
+        report = None
+        for name in ("refine_report.json",):
+            try:
+                candidate = json.loads((base / "german_refines" / name).read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if isinstance(candidate, dict):
+                report = candidate
+                break
+        chapters: List[Dict[str, Any]] = []
+        if report and report.get("chapters"):
+            chapters = [ch for ch in report["chapters"] if isinstance(ch, dict)]
+        return {
+            "language": language,
+            "run_status": status.get("status"),
+            "batches_total": (report or {}).get("batches_total"),
+            "chapters": chapters,
+        }
+
+    @app.get("/api/books/{book_id}/german-refine/versions")
+    def german_refine_versions(book_id: str, language: Optional[str] = None):
+        get_book_or_404(book_id)
+        language = language or _german_language(book_id)
+        directory = german_refine_engine.refined_dir(
+            german_refine_engine.slug_dir(DATA_ROOT / str(book_id), language)
+        )
+        chapters: List[Dict[str, Any]] = []
+        if directory.exists():
+            for chapter_dir in sorted(directory.glob("ch*")):
+                match = re.fullmatch(r"ch(\d+)", chapter_dir.name)
+                if not chapter_dir.is_dir() or not match:
+                    continue
+                cid = int(match.group(1))
+                versions: List[Dict[str, Any]] = []
+                for number in german_refine_engine.existing_versions(directory, cid):
+                    payload = german_refine_engine.read_version(directory, cid, number) or {}
+                    versions.append(
+                        {
+                            "version": number,
+                            "created": payload.get("created"),
+                            "words": payload.get("words") or 0,
+                            "models": payload.get("models") or {},
+                        }
+                    )
+                chapters.append(
+                    {
+                        "chapter_id": cid,
+                        "chapter_name": (german_refine_engine.read_version(directory, cid, None) or {}).get("chapter_name")
+                        or f"Chapter {cid + 1}",
+                        "active_version": (german_refine_engine.read_version(directory, cid, None) or {}).get("version") if versions else None,
+                        "versions": versions,
+                    }
+                )
+        return {"chapters": chapters, "language": language}
+
+    @app.get("/api/books/{book_id}/german-refine/version")
+    def german_refine_version(book_id: str, chapter_id: int, language: Optional[str] = None, version: Optional[int] = None):
+        get_book_or_404(book_id)
+        language = language or _german_language(book_id)
+        directory = german_refine_engine.refined_dir(
+            german_refine_engine.slug_dir(DATA_ROOT / str(book_id), language)
+        )
+        payload = german_refine_engine.read_version(directory, chapter_id, version)
+        if payload is None:
+            raise HTTPException(404, "no such german refined version")
+        return payload
+
+    @app.post("/api/books/{book_id}/german-refine/versions/select")
+    def german_refine_select_version(book_id: str, payload: GermanRefineSelectIn):
+        get_book_or_404(book_id)
+        runner = german_refines.get(book_id)
+        if runner._task is not None and not runner._task.done():
+            raise HTTPException(409, "german refiner busy; stop the run before switching versions")
+        language = payload.language or _german_language(book_id)
+        slug = german_refine_engine.slug_dir(DATA_ROOT / str(book_id), language)
+        try:
+            result = german_refine_engine.set_active_german_version(slug, payload.chapter_id, payload.version)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc))
+        return {**result, "status": runner._meta()}
+
+    @app.post("/api/books/{book_id}/german-refine/reset-all")
+    async def german_refine_reset_all(book_id: str, language: Optional[str] = None):
+        get_book_or_404(book_id)
+        runner = german_refines.get(book_id)
+        if runner._task is not None and not runner._task.done():
+            raise HTTPException(409, "german refiner busy; stop the run before deleting")
+        removed = german_refine_engine.reset_german_refine_all(
+            german_refine_engine.slug_dir(DATA_ROOT / str(book_id), language or _german_language(book_id))
+        )
+        return {"removed": removed}
+
+    @app.get("/api/books/{book_id}/german-refine/file")
+    def german_refine_file(book_id: str, path: str, language: Optional[str] = None):
+        get_book_or_404(book_id)
+        language = language or _german_language(book_id)
+        base = german_refine_engine.slug_dir(DATA_ROOT / str(book_id), language).resolve()
+        target = (base / path).resolve()
+        if not str(target).startswith(str(base)):
+            raise HTTPException(400, "invalid path")
+        if target.suffix.lower() not in (".txt", ".md", ".json"):
+            raise HTTPException(400, "only .txt/.md/.json can be previewed")
+        if not target.is_file():
+            raise HTTPException(404, f"no such output: {path}")
+        content = target.read_text(encoding="utf-8", errors="replace")
+        return {"path": path, "content": content[:400_000]}
+
+    # ------------------------------------------------------------------ wizard
+
+    def _wizard_steps_from_payload(payload_steps: List[WizardStepIn]) -> List[Dict[str, Any]]:
+        """Map the incoming step payload onto the 6 canonical step defaults."""
+        defaults = {row["kind"]: row for row in wizard_state.default_steps()}
+        steps: List[Dict[str, Any]] = []
+        for kind in (row["kind"] for row in wizard_state.default_steps()):
+            row = dict(defaults[kind])
+            supplied = next((s for s in payload_steps if s.kind == kind), None)
+            if supplied is not None:
+                data = supplied.model_dump()
+                for key in supplied.model_fields_set:
+                    if key in ("step", "kind"):
+                        continue
+                    row[key] = data[key]
+            steps.append(row)
+        return steps
+
+    def _wizard_validate(payload: WizardCreateIn) -> None:
+        """Config validation before a wizard book is created (edge cases 6/7).
+
+        Wizard books are ALWAYS written in English; the language of the book
+        is not configurable — steps 5/6 decide whether a translation pass runs
+        afterwards."""
+        book_in = payload.book
+        if not (book_in.title or "").strip():
+            raise HTTPException(400, "title required")
+        if not (book_in.story_prompt or "").strip():
+            raise HTTPException(400, "story_prompt (the book idea) required")
+        target_words = int(book_in.target_words or 0)
+        if target_words <= 0:
+            raise HTTPException(400, "target_words must be positive")
+        steps = _wizard_steps_from_payload(payload.steps or [])
+        for row in steps:
+            kind = row["kind"]
+            enabled = bool(row.get("enabled", True))
+            if not enabled:
+                continue
+            if kind == "outline":
+                if not row.get("planner_profile_id"):
+                    raise HTTPException(400, "Step 1 (outline): planner_profile_id required")
+            elif kind == "write":
+                if not row.get("writer_profile_id"):
+                    raise HTTPException(400, "Step 3 (write): writer_profile_id required")
+            elif kind in ("outline_refine", "text_refine", "translate_refine"):
+                candidates = list(row.get("candidate_profile_ids") or [])
+                if not candidates:
+                    raise HTTPException(400, f"Step {row['step']} ({kind}): at least one candidate profile required")
+                if len(candidates) > 6:
+                    raise HTTPException(400, f"Step {row['step']} ({kind}): maximum 6 candidate profiles")
+            elif kind == "translate":
+                if not row.get("draft_profile_id"):
+                    raise HTTPException(400, "Step 5 (translate): draft_profile_id required")
+                if not row.get("refiner_profile_id"):
+                    raise HTTPException(400, "Step 5 (translate): refiner_profile_id required")
+        enabled_kinds = [row["kind"] for row in steps if row.get("enabled", True)]
+        if not enabled_kinds:
+            raise HTTPException(400, "enable at least one step")
+        prerequisites = {
+            "outline_refine": "outline",
+            "write": "outline",
+            "text_refine": "write",
+            "translate": "write",
+            "translate_refine": "translate",
+        }
+        enabled = {row["kind"]: True for row in steps if row.get("enabled", True)}
+        for kind, prerequisite in prerequisites.items():
+            if kind in enabled and prerequisite not in enabled:
+                raise HTTPException(400, f"Step ({kind}) needs the {prerequisite} step enabled first")
+        # profile existence + model checks (edge case 7)
+        def _check(profile_id: Optional[str], role: str) -> None:
+            if not profile_id:
+                return
+            profile = profiles.get(str(profile_id))
+            if profile is None:
+                raise HTTPException(400, f"{role}: profile {profile_id} not found")
+            if not profile.get("model"):
+                raise HTTPException(400, f"{role}: profile '{profile.get('name')}' has no model configured")
+
+        for row in steps:
+            if not row.get("enabled", True):
+                continue
+            kind = row["kind"]
+            _check(row.get("planner_profile_id"), "Step 1 planner")
+            _check(row.get("writer_profile_id"), "Step 3 writer")
+            _check(row.get("judge_profile_id"), "judge")
+            for index, candidate_id in enumerate(row.get("candidate_profile_ids") or []):
+                _check(candidate_id, f"candidate {index + 1}")
+            if kind == "translate":
+                _check(row.get("draft_profile_id"), "translation draft")
+                _check(row.get("refiner_profile_id"), "translation refiner")
+                _check(row.get("checker_profile_id"), "translation checker")
+        return steps
+
+    @app.post("/api/wizard")
+    async def wizard_create(payload: WizardCreateIn):
+        steps = _wizard_validate(payload)
+        book_in = payload.book
+        codex_payload = book_in.codex_min or CodexIn()
+        codex = {
+            "characters": [row.model_dump() for row in codex_payload.characters],
+            "settings": [row.model_dump() for row in codex_payload.settings],
+            "lore": [row.model_dump() for row in codex_payload.lore],
+        }
+        by_kind = {row["kind"]: row for row in steps}
+        book = store.create_book(
+            (book_in.title or "").strip(),
+            book_in.story_prompt,
+            "en",  # the wizard always writes the book in English — steps 5/6 decide about the translation pass
+            int(book_in.target_words),
+            book_in.genre_notes or "",
+            codex=codex,
+        )
+        if (by_kind.get("outline") or {}).get("enabled", True):
+            book["planner_profile_id"] = by_kind["outline"].get("planner_profile_id")
+        if (by_kind.get("write") or {}).get("enabled", True):
+            book["writer_profile_id"] = by_kind["write"].get("writer_profile_id")
+        book["status"] = "empty"
+        store.save_book(book)
+        config = {
+            "book": {
+                "title": book["title"],
+                "story_prompt": book["story_prompt"],
+                "language": book["language"],
+                "target_words": book["target_words"],
+                "genre_notes": book["genre_notes"],
+                "codex_min": codex,
+            },
+            "steps": steps,
+            "pause_between_steps": payload.pause_between_steps,
+        }
+        wizard_runner = wizards.get(book["id"])
+        try:
+            await wizard_runner.attach(config)
+        except Exception as exc:
+            try:
+                store.delete_book(book["id"])
+            except Exception:
+                pass
+            raise HTTPException(400, f"wizard start failed: {exc}")
+        return {"book": book, "wizard_state": wizard_runner.live_view()}
+
+    @app.get("/api/wizards")
+    def wizard_list():
+        return {"wizards": wizards.list_all()}
+
+    @app.get("/api/books/{book_id}/wizard/state")
+    def wizard_get_state(book_id: str):
+        get_book_or_404(book_id)
+        return {"wizard_state": wizards.get(book_id).live_view()}
+
+    @app.post("/api/books/{book_id}/wizard/pause")
+    async def wizard_pause(book_id: str):
+        get_book_or_404(book_id)
+        error = await wizards.get(book_id).pause()
+        if error:
+            raise HTTPException(409, error)
+        return {"wizard_state": wizards.get(book_id).live_view()}
+
+    @app.post("/api/books/{book_id}/wizard/resume")
+    async def wizard_resume(book_id: str):
+        get_book_or_404(book_id)
+        error = await wizards.get(book_id).resume()
+        if error:
+            raise HTTPException(409, error)
+        return {"wizard_state": wizards.get(book_id).live_view()}
+
+    @app.post("/api/books/{book_id}/wizard/stop")
+    async def wizard_stop(book_id: str):
+        get_book_or_404(book_id)
+        error = await wizards.get(book_id).stop()
+        if error:
+            raise HTTPException(409, error)
+        return {"wizard_state": wizards.get(book_id).live_view()}
+
+    @app.post("/api/books/{book_id}/wizard/retry-step")
+    async def wizard_retry_step(book_id: str, payload: WizardRetryIn):
+        get_book_or_404(book_id)
+        error = await wizards.get(book_id).retry_step(int(payload.step))
+        if error:
+            raise HTTPException(409, error)
+        return {"wizard_state": wizards.get(book_id).live_view()}
+
+    @app.patch("/api/books/{book_id}/wizard/config")
+    async def wizard_patch_config(book_id: str, payload: WizardConfigPatchIn):
+        get_book_or_404(book_id)
+        patch = payload.model_dump(exclude_none=True)
+        error = wizards.get(book_id).apply_config_patch(patch)
+        if error:
+            raise HTTPException(409, error)
+        return {"wizard_state": wizards.get(book_id).live_view()}
+
+    @app.delete("/api/books/{book_id}/wizard")
+    async def wizard_delete(book_id: str):
+        get_book_or_404(book_id)
+        runner = wizards.get(book_id)
+        if runner.has_live_task():
+            raise HTTPException(409, "wizard is running — stop it first")
+        import shutil as _sh
+
+        directory = wizard_state.wizard_dir(DATA_ROOT / str(book_id))
+        if directory.exists():
+            _sh.rmtree(directory)
+        runner.state = None
+        runner._task = None
+        return {"ok": True}
+
     @app.get("/api/books/{book_id}/events")
     async def events(book_id: str):
         get_book_or_404(book_id)
@@ -1234,6 +1701,8 @@ def create_app() -> FastAPI:
         translations.get(book_id).bind_emit(runner._emit)
         refines.get(book_id).bind_emit(runner._emit)
         outline_refines.get(book_id).bind_emit(runner._emit)
+        german_refines.get(book_id).bind_emit(runner._emit)
+        wizards.get(book_id).bind_emit(runner._emit)
         queue = await runner.subscribe()
 
         async def generator():

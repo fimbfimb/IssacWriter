@@ -22,6 +22,7 @@ Hard storage rules (same doctrine as the manuscript refiner):
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -33,6 +34,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from ..llm.provider import LlmClient, LlmProfile
 from ..translation.ensemble import (
     TranslationStopped,
+    _parse_judge_decision,
     codex_glossary,
     signal_call,
     style_context,
@@ -177,6 +179,37 @@ def _chapter_list_json(chapters: List[Dict[str, Any]]) -> str:
         for ch in chapters
     ]
     return json.dumps(compact, ensure_ascii=False, indent=2)
+
+
+def outline_judge_messages(
+    source_description: str,
+    candidates: List[Dict[str, Any]],
+    language: str,
+    book: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Judge prompt for candidate chapter briefs (ensemble of refiners)."""
+    system_parts = [
+        "You are a demanding story editor.",
+        f"Several refined chapter briefs of ONE outline chapter were produced by different models. The brief language is {language}.",
+        "Pick the candidate with the best combination of:",
+        "1) fidelity — every fact of the original chapter description is present; nothing missing, nothing invented",
+        "2) usefulness for a novelist — clear POV, concrete setting, actionable Scenes/Beats, a real cliffhanger",
+        "3) prose quality — no filler, no placeholders, no meta commentary, consistent tone",
+        'Respond ONLY with JSON exactly like {"winner": <candidate number>, "reason": "<one short sentence>"}.',
+    ]
+    style = style_context(book)
+    if style:
+        system_parts.append(style)
+    glossary = codex_glossary(book)
+    if glossary:
+        system_parts.append(glossary)
+    numbered = "\n\n".join(
+        f"--- CANDIDATE {i + 1} ({c['name']}) ---\n{c['text']}" for i, c in enumerate(candidates)
+    )
+    return [
+        {"role": "system", "content": "\n".join(system_parts)},
+        {"role": "user", "content": f"--- ORIGINAL CHAPTER DESCRIPTION ---\n{source_description}\n\n{numbered}"},
+    ]
 
 
 def _beats_for(word_count: int) -> int:
@@ -363,6 +396,7 @@ class OutlineBriefWriter:
             "models": {
                 "profile": (meta.get("profile") or {}).get("name"),
                 "model": (meta.get("profile") or {}).get("model"),
+                "winner": entry.get("winner"),
             },
         }
         target = self.refined_dir / f"ch{cid:04d}" / f"v{version:04d}.json"
@@ -419,12 +453,20 @@ async def run_outline_refinement(
     refined_dir: Path,
     resume: bool,
     structured: bool = True,
+    candidates: Optional[List[Dict[str, Any]]] = None,
+    judge: Optional[Dict[str, Any]] = None,
+    parallel_candidates: bool = False,
     emit: Callable[[Dict[str, Any]], Awaitable[None]],
     should_stop: Callable[[], bool],
     client_factory: Optional[Callable[[Dict[str, Any]], Any]] = None,
 ) -> Dict[str, Any]:
     """Refine chapter briefs one chapter at a time; commit each as a new outline
-    version. The outline in book.json is consumed read-only."""
+    version. The outline in book.json is consumed read-only.
+
+    Optional candidate ensemble (wizard): every candidate profile produces the
+    brief, a judge (if configured) picks the winner, and the polish rounds run
+    on the winner's profile. Without candidates the call behaves exactly like
+    before (single profile)."""
     started = time.time()
     outdir.mkdir(parents=True, exist_ok=True)
     refined_dir.mkdir(parents=True, exist_ok=True)
@@ -438,6 +480,13 @@ async def run_outline_refinement(
     profile_name = str(profile.get("name") or profile.get("model") or "refiner")
     refine_rounds = max(1, int(refine_rounds))
     similarity_stop = min(1.0, max(0.0, float(similarity_stop)))
+    candidates = [dict(c) for c in (candidates or []) if isinstance(c, dict) and c]
+    ensemble_active = len(candidates) >= 2
+    judge_name = (
+        str((judge or {}).get("name") or (judge or {}).get("model") or "Judge")
+        if judge
+        else None
+    )
 
     meta: Dict[str, Any] = {
         "mode": "outline_refine",
@@ -452,6 +501,13 @@ async def run_outline_refinement(
         "started_at": started,
         "totals": {"tokens": {}},
     }
+    if ensemble_active:
+        meta["candidates"] = [
+            {"name": str(c.get("name") or c.get("model") or "?"), "model": c.get("model")}
+            for c in candidates
+        ]
+        meta["judged_by"] = judge_name
+        meta["parallel_candidates"] = bool(parallel_candidates)
     totals = meta["totals"]
 
     def _accumulate(name: str, usage: Dict[str, Any]) -> None:
@@ -520,6 +576,8 @@ async def run_outline_refinement(
         return LlmClient(LlmProfile(**p))
 
     client = _client(profile)
+    candidate_clients = [_client(c) for c in candidates] if ensemble_active else []
+    judge_client = _client(judge) if (judge and ensemble_active) else None
     _unload = _make_unload(unload_after_call)
     try:
         for index, chapter in enumerate(chapters):
@@ -554,6 +612,9 @@ async def run_outline_refinement(
                 continue
 
             # ---- Pass 1: Brief erstellen ---------------------------------
+            polish_profile = profile
+            polish_client = client
+            polish_name = profile_name
             if entry.get("stage") == "brief" and not (entry.get("brief") or "").strip():
                 detail = f"Kapitel {cid + 1} · Brief erstellen"
                 previous_briefs = [
@@ -561,49 +622,186 @@ async def run_outline_refinement(
                     for i in range(0 if int(context_prev) <= 0 else max(0, index - int(context_prev)), index)
                     if i < len(writer.finished) and (writer.finished[i].get("brief") or "").strip()
                 ]
-                try:
-                    text, notes, usage = await signal_call(
-                        emit,
-                        profile_name,
-                        detail,
-                        lambda: call_structured(
-                            client,
-                            brief_messages(book, chapters, index, language, previous_briefs),
-                            BRIEF_TEMPERATURE,
-                            structured=structured,
-                        ),
-                    )
-                    _accumulate(profile_name, _role_usage(usage))
-                    await _unload(profile)
-                except Exception as exc:
-                    await _unload(profile)
-                    entry["errors"].append(f"brief: {exc}")
+                if ensemble_active:
+                    produced: List[Dict[str, Any]] = []
+                    cand_errors: List[str] = []
+
+                    async def _run_candidate(
+                        cand_index: int, cand_profile: Dict[str, Any], cand_client: Any, do_unload: bool
+                    ) -> Optional[Dict[str, Any]]:
+                        cand_name = str(
+                            cand_profile.get("name") or cand_profile.get("model") or f"Kandidat {cand_index + 1}"
+                        )
+                        cand_detail = f"Kapitel {cid + 1} · Brief erstellen (Kandidat {cand_index + 1}/{len(candidates)})"
+                        try:
+                            cand_text, cand_notes, cand_usage = await signal_call(
+                                emit,
+                                cand_name,
+                                cand_detail,
+                                lambda: call_structured(
+                                    cand_client,
+                                    brief_messages(book, chapters, index, language, previous_briefs),
+                                    BRIEF_TEMPERATURE,
+                                    structured=structured,
+                                ),
+                            )
+                            _accumulate(cand_name, _role_usage(cand_usage))
+                            if do_unload:
+                                await _unload(cand_profile)
+                            return {
+                                "name": cand_name,
+                                "profile": cand_profile,
+                                "client": cand_client,
+                                "text": cand_text,
+                                "notes": cand_notes,
+                            }
+                        except Exception as exc:
+                            cand_errors.append(f"{cand_name}: {exc}")
+                            if do_unload:
+                                await _unload(cand_profile)
+                            return None
+
+                    if parallel_candidates:
+                        results = await asyncio.gather(
+                            *[
+                                _run_candidate(c_index, cand, candidate_clients[c_index], False)
+                                for c_index, cand in enumerate(candidates)
+                            ],
+                            return_exceptions=True,
+                        )
+                        for cand, result in zip(candidates, results):
+                            if isinstance(result, Exception):
+                                cand_errors.append(f"{cand.get('name') or cand.get('model')}: {result}")
+                            elif result is not None:
+                                produced.append(result)
+                        for cand in candidates:
+                            await _unload(cand)
+                    else:
+                        for c_index, cand in enumerate(candidates):
+                            if should_stop():
+                                writer.persist({**meta, "interrupted": True})
+                                raise TranslationStopped()
+                            result = await _run_candidate(c_index, cand, candidate_clients[c_index], True)
+                            if result is not None:
+                                produced.append(result)
+
+                    if not produced:
+                        entry["errors"].append(
+                            "brief: " + ("; ".join(cand_errors) or "all candidate briefs failed")
+                        )
+                        writer.set_entry(index, entry)
+                        writer.persist(meta)
+                        await emit(
+                            {
+                                "type": "outline_refine_batch",
+                                "batch_index": index + 1,
+                                "batches_total": len(chapters),
+                                "chapter_id": cid,
+                                "error": "; ".join(cand_errors) or "all candidate briefs failed",
+                            }
+                        )
+                        continue
+
+                    decision = {"winner": 1, "reason": ""}
+                    if judge_client is not None and len(produced) >= 2:
+                        if should_stop():
+                            writer.persist({**meta, "interrupted": True})
+                            raise TranslationStopped()
+                        try:
+                            j_response = await signal_call(
+                                emit,
+                                judge_name or "Judge",
+                                f"Kapitel {cid + 1} · Brief-Judge",
+                                lambda: judge_client.chat(
+                                    outline_judge_messages(
+                                        chapter.get("description") or "", produced, language, book
+                                    ),
+                                    temperature=0.2,
+                                    max_output_tokens=1200,
+                                ),
+                            )
+                            decision = _parse_judge_decision(j_response.content or "", len(produced))
+                            _accumulate(judge_name or "Judge", _role_usage(j_response.usage))
+                        except Exception as exc:
+                            decision = _parse_judge_decision("", len(produced))
+                            decision["reason"] = f"judge failed ({exc}); defaulted"
+                        await _unload(judge or {})
+                    winner = produced[max(1, int(decision["winner"])) - 1]
+                    entry["brief"] = winner["text"]
+                    entry["rounds"] = 1
+                    for note in winner["notes"]:
+                        entry["notes"].append(note)
+                        _review_note(entry, "annotation", None, note)
+                    entry["candidates"] = [p["name"] for p in produced]
+                    entry["winner"] = winner["name"]
+                    entry["judge_reason"] = str(decision.get("reason") or "")
+                    entry["candidate_errors"] = list(cand_errors)
+                    entry["stage"] = "briefed"
+                    polish_profile = winner["profile"]
+                    polish_client = winner["client"]
+                    polish_name = winner["name"]
                     writer.set_entry(index, entry)
                     writer.persist(meta)
                     await emit(
                         {
-                            "type": "outline_refine_batch",
-                            "batch_index": index + 1,
-                            "batches_total": len(chapters),
-                            "chapter_id": cid,
-                            "error": str(exc),
+                            "type": "wizard_candidates",
+                            "unit": f"brief ch{cid + 1}",
+                            "candidates": entry["candidates"],
+                            "winner": winner["name"],
+                            "reason": str(decision.get("reason") or ""),
                         }
                     )
-                    continue
-                entry["brief"] = text
-                entry["rounds"] = 1
-                for note in notes:
-                    entry["notes"].append(note)
-                    _review_note(entry, "annotation", None, note)
-                entry["stage"] = "briefed"
-                writer.set_entry(index, entry)
-                writer.persist(meta)
-                await emit(
-                    {
-                        "type": "outline_refine_output",
-                        "lines": [f"[{profile_name}] {_first_line(text)}"],
-                    }
-                )
+                    await emit(
+                        {
+                            "type": "outline_refine_output",
+                            "lines": [f"[{winner['name']}] {_first_line(winner['text'])}"],
+                        }
+                    )
+
+                else:
+                    try:
+                        text, notes, usage = await signal_call(
+                            emit,
+                            profile_name,
+                            detail,
+                            lambda: call_structured(
+                                client,
+                                brief_messages(book, chapters, index, language, previous_briefs),
+                                BRIEF_TEMPERATURE,
+                                structured=structured,
+                            ),
+                        )
+                        _accumulate(profile_name, _role_usage(usage))
+                        await _unload(profile)
+                    except Exception as exc:
+                        await _unload(profile)
+                        entry["errors"].append(f"brief: {exc}")
+                        writer.set_entry(index, entry)
+                        writer.persist(meta)
+                        await emit(
+                            {
+                                "type": "outline_refine_batch",
+                                "batch_index": index + 1,
+                                "batches_total": len(chapters),
+                                "chapter_id": cid,
+                                "error": str(exc),
+                            }
+                        )
+                        continue
+                    entry["brief"] = text
+                    entry["rounds"] = 1
+                    for note in notes:
+                        entry["notes"].append(note)
+                        _review_note(entry, "annotation", None, note)
+                    entry["stage"] = "briefed"
+                    writer.set_entry(index, entry)
+                    writer.persist(meta)
+                    await emit(
+                        {
+                            "type": "outline_refine_output",
+                            "lines": [f"[{profile_name}] {_first_line(text)}"],
+                        }
+                    )
 
             # ---- Pass 2..N: Brief verfeinern ------------------------------
             for round_no in range(2, refine_rounds + 1):
@@ -621,19 +819,19 @@ async def run_outline_refinement(
                 try:
                     text, notes, usage = await signal_call(
                         emit,
-                        profile_name,
+                        polish_name,
                         detail,
                         lambda: call_structured(
-                            client,
+                            polish_client,
                             brief_messages(book, chapters, index, language, previous_briefs, current_text=entry["brief"]),
                             POLISH_TEMPERATURE,
                             structured=structured,
                         ),
                     )
-                    _accumulate(profile_name, _role_usage(usage))
-                    await _unload(profile)
+                    _accumulate(polish_name, _role_usage(usage))
+                    await _unload(polish_profile)
                 except Exception as exc:
-                    await _unload(profile)
+                    await _unload(polish_profile)
                     entry["errors"].append(f"polish round {round_no}: {exc}")
                     break
                 ratio = similar_ratio(entry["brief"], text)
@@ -693,6 +891,7 @@ async def run_outline_refinement(
             "review_notes": sum(len(e.get("notes") or []) for e in writer.finished),
         }
     finally:
-        close = getattr(client, "aclose", None)
-        if close is not None:
-            await close()
+        for open_client in [client, *candidate_clients, judge_client]:
+            close = getattr(open_client, "aclose", None)
+            if close is not None:
+                await close()

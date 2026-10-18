@@ -11,6 +11,8 @@ import type {
   SequelProposal,
   StateCollection,
   Stats,
+  WizardState,
+  WizardSummary,
 } from "./types";
 
 const BASE = "";
@@ -447,6 +449,137 @@ export const api = {
     ),
   outlineRefineResetAll: (id: string) =>
     request<{ removed: string[] }>(`/api/books/${id}/outline-refine/reset-all`, { method: "POST" }),
+
+  wizardCreate: (
+    data: {
+      book: {
+        title: string;
+        story_prompt: string;
+        language?: string;
+        target_words?: number;
+        genre_notes?: string;
+        codex_min?: Record<string, any> | null;
+      };
+      steps: {
+        step: number;
+        kind: string;
+        enabled?: boolean;
+        planner_profile_id?: string | null;
+        writer_profile_id?: string | null;
+        candidate_profile_ids?: string[];
+        judge_profile_id?: string | null;
+        parallel?: boolean;
+        refine_rounds?: number | null;
+        similarity_stop?: number | null;
+        context_prev?: number | null;
+        style_probe?: string | null;
+        draft_temperature?: number | null;
+        batch_words?: number | null;
+        target_language?: string | null;
+        draft_profile_id?: string | null;
+        refiner_profile_id?: string | null;
+        checker_profile_id?: string | null;
+      }[];
+      pause_between_steps?: boolean;
+    },
+  ) =>
+    request<{ book: Book; wizard_state: WizardState | null }>("/api/wizard", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+  wizardList: () =>
+    request<{ wizards: WizardSummary[] }>("/api/wizards"),
+  wizardState: (id: string) =>
+    request<{ wizard_state: WizardState | null }>(`/api/books/${id}/wizard/state`),
+  wizardPause: (id: string) =>
+    request<{ wizard_state: WizardState | null }>(`/api/books/${id}/wizard/pause`, { method: "POST" }),
+  wizardResume: (id: string) =>
+    request<{ wizard_state: WizardState | null }>(`/api/books/${id}/wizard/resume`, { method: "POST" }),
+  wizardStop: (id: string) =>
+    request<{ wizard_state: WizardState | null }>(`/api/books/${id}/wizard/stop`, { method: "POST" }),
+  wizardRetryStep: (id: string, step: number) =>
+    request<{ wizard_state: WizardState | null }>(`/api/books/${id}/wizard/retry-step`, {
+      method: "POST",
+      body: JSON.stringify({ step }),
+    }),
+  wizardPatchConfig: (id: string, patch: { pause_between_steps?: boolean; steps?: Record<string, any>[] }) =>
+    request<{ wizard_state: WizardState | null }>(`/api/books/${id}/wizard/config`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  wizardDelete: (id: string) =>
+    request<{ ok: boolean }>(`/api/books/${id}/wizard`, { method: "DELETE" }),
+
+  germanRefineStart: (
+    id: string,
+    data: {
+      language?: string;
+      profile_id?: string | null;
+      candidate_profile_ids?: string[];
+      judge_profile_id?: string | null;
+      parallel_candidates?: boolean;
+      unload_after_call?: boolean;
+      resume?: boolean;
+      batch_words?: number;
+      refine_rounds?: number;
+      similarity_stop?: number;
+      structured?: boolean;
+      style_probe?: string;
+    },
+  ) =>
+    request<{ status: any }>(`/api/books/${id}/german-refine`, {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+  germanRefineStatus: (id: string) =>
+    request<{ status: Record<string, any> }>(`/api/books/${id}/german-refine/status`),
+  germanRefineStop: (id: string) =>
+    request<{ status: any }>(`/api/books/${id}/german-refine/stop`, { method: "POST" }),
+  germanRefineProgress: (id: string) =>
+    request<{
+      language: string;
+      run_status: string | null;
+      batches_total: number | null;
+      chapters: {
+        chapter_id: number;
+        chapter_name?: string;
+        started?: boolean;
+        done?: boolean;
+        batches_total?: number;
+        batches_done?: number;
+        refined_words?: number;
+        versions?: number[];
+        active_version?: number | null;
+      }[];
+    }>(`/api/books/${id}/german-refine/progress`),
+  germanRefineVersions: (id: string) =>
+    request<{
+      language: string;
+      chapters: {
+        chapter_id: number;
+        chapter_name: string;
+        active_version: number | null;
+        versions: { version: number; created: string | null; words: number; models: Record<string, unknown> }[];
+      }[];
+    }>(`/api/books/${id}/german-refine/versions`),
+  germanRefineVersion: (id: string, chapterId: number, version?: number, language?: string) =>
+    request<Record<string, any>>(
+      `/api/books/${id}/german-refine/version?chapter_id=${chapterId}${version ? `&version=${version}` : ""}${language ? `&language=${encodeURIComponent(language)}` : ""}`,
+    ),
+  germanRefineSelectVersion: (id: string, chapterId: number, version: number, language?: string) =>
+    request<{ chapter_id: number; version: number; status: any }>(
+      `/api/books/${id}/german-refine/versions/select`,
+      { method: "POST", body: JSON.stringify({ chapter_id: chapterId, version, language }) },
+    ),
+  germanRefineResetAll: (id: string, language?: string) =>
+    request<{ removed: string[] }>(
+      `/api/books/${id}/german-refine/reset-all${language ? `?language=${encodeURIComponent(language)}` : ""}`,
+      { method: "POST" },
+    ),
+  germanRefineFile: (id: string, path: string, language?: string) =>
+    request<{ path: string; content: string }>(
+      `/api/books/${id}/german-refine/file?path=${encodeURIComponent(path)}${language ? `&language=${encodeURIComponent(language)}` : ""}`,
+    ),
 };
 
 export function openEventStream(bookId: string, onEvent: (event: any) => void): () => void {

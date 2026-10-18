@@ -319,3 +319,72 @@ export type Stats = {
   open_threads: { key: string; opened_at: number | null }[];
   state_now: StateCollection;
 };
+
+export type WizardStepKind = "outline" | "outline_refine" | "write" | "text_refine" | "translate" | "translate_refine";
+
+export type WizardStepConfig = {
+  step: number;
+  kind: WizardStepKind;
+  enabled: boolean;
+  planner_profile_id?: string | null;
+  writer_profile_id?: string | null;
+  candidate_profile_ids?: string[];
+  judge_profile_id?: string | null;
+  parallel?: boolean;
+  refine_rounds?: number | null;
+  similarity_stop?: number | null;
+  context_prev?: number | null;
+  style_probe?: string | null;
+  draft_temperature?: number | null;
+  batch_words?: number | null;
+  target_language?: string | null;
+  draft_profile_id?: string | null;
+  refiner_profile_id?: string | null;
+  checker_profile_id?: string | null;
+};
+
+export type WizardBookConfig = {
+  title: string;
+  story_prompt: string;
+  language: string;
+  target_words: number;
+  genre_notes: string;
+  codex_min: Codex | null;
+};
+
+export type WizardStepState = {
+  step: number;
+  kind: WizardStepKind;
+  status: "pending" | "running" | "paused" | "done" | "error" | "skipped";
+  started_at: string | null;
+  finished_at: string | null;
+  error: string | null;
+  progress: { done: number; total: number | null; frozen?: boolean };
+  engine?: {
+    status: string | null;
+    error: string | null;
+    task_alive: boolean;
+    activity: LlmActivity | null;
+    last_activity: number | null;
+  } | null;
+};
+
+export type WizardState = {
+  id: string;
+  status: "config" | "running" | "pausing" | "paused" | "stopping" | "stopped" | "done" | "error";
+  config: { book: WizardBookConfig; steps: WizardStepConfig[]; pause_between_steps: boolean };
+  current_step: number | null;
+  steps_state: WizardStepState[];
+  history: { at: string; event: string }[];
+  created: string;
+  updated: string;
+};
+
+export type WizardSummary = {
+  book_id: string;
+  title: string;
+  status: string;
+  current_step: number | null;
+  created: string | null;
+  updated: string | null;
+};

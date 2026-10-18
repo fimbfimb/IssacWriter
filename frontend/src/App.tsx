@@ -5,6 +5,7 @@ import { api } from "./api";
 
 export default function App() {
   const [bookId, setBookId] = useState<string | null>(null);
+  const [bookTab, setBookTab] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -31,8 +32,12 @@ export default function App() {
       {bookId ? (
         <BookPage
           bookId={bookId}
+          initialTab={bookTab as any}
           onBack={() => setBookId(null)}
-          onOpen={(id) => setBookId(id)}
+          onOpen={(id, tab) => {
+            setBookTab(tab ?? null);
+            setBookId(id);
+          }}
           showToast={showToast}
         />
       ) : (

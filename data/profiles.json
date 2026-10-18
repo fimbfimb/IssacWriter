@@ -105,5 +105,83 @@
     "thinking": "default",
     "extra_params": {},
     "id": "fe39df67"
+  },
+  "5ed31f70": {
+    "name": "TglWizA",
+    "base_url": "http://127.0.0.1:9393/v1",
+    "api_key": "k",
+    "model": "mock-storyforge",
+    "temperature": 0.7,
+    "max_output_tokens": 32768,
+    "price_in_per_m": 0.0,
+    "price_out_per_m": 0.0,
+    "thinking": "default",
+    "extra_params": null,
+    "id": "5ed31f70"
+  },
+  "8b541340": {
+    "name": "TglWizB",
+    "base_url": "http://127.0.0.1:9393/v1",
+    "api_key": "k",
+    "model": "mock-storyforge",
+    "temperature": 0.7,
+    "max_output_tokens": 32768,
+    "price_in_per_m": 0.0,
+    "price_out_per_m": 0.0,
+    "thinking": "default",
+    "extra_params": null,
+    "id": "8b541340"
+  },
+  "3332e390": {
+    "name": "TglWizJ",
+    "base_url": "http://127.0.0.1:9393/v1",
+    "api_key": "k",
+    "model": "mock-storyforge",
+    "temperature": 0.7,
+    "max_output_tokens": 32768,
+    "price_in_per_m": 0.0,
+    "price_out_per_m": 0.0,
+    "thinking": "default",
+    "extra_params": null,
+    "id": "3332e390"
+  },
+  "048b86e4": {
+    "name": "TglWizA2",
+    "base_url": "http://127.0.0.1:9393/v1",
+    "api_key": "k",
+    "model": "mock-storyforge",
+    "temperature": 0.7,
+    "max_output_tokens": 32768,
+    "price_in_per_m": 0.0,
+    "price_out_per_m": 0.0,
+    "thinking": "default",
+    "extra_params": null,
+    "id": "048b86e4"
+  },
+  "b53c864b": {
+    "name": "TglWizB2",
+    "base_url": "http://127.0.0.1:9393/v1",
+    "api_key": "k",
+    "model": "mock-storyforge",
+    "temperature": 0.7,
+    "max_output_tokens": 32768,
+    "price_in_per_m": 0.0,
+    "price_out_per_m": 0.0,
+    "thinking": "default",
+    "extra_params": null,
+    "id": "b53c864b"
+  },
+  "b2ea8ef5": {
+    "name": "TglWizJ2",
+    "base_url": "http://127.0.0.1:9393/v1",
+    "api_key": "k",
+    "model": "mock-storyforge",
+    "temperature": 0.7,
+    "max_output_tokens": 32768,
+    "price_in_per_m": 0.0,
+    "price_out_per_m": 0.0,
+    "thinking": "default",
+    "extra_params": null,
+    "id": "b2ea8ef5"
   }
 }

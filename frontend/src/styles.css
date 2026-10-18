@@ -317,6 +317,30 @@ button:disabled { opacity: 0.45; cursor: default; }
 
 .inline-note { font-size: 12px; color: var(--text-dim); margin: 4px 0 8px; }
 
+.wizard-steps { display: grid; gap: 6px; }
+.wizard-step-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-soft);
+}
+.wizard-step-row.active { border-color: var(--accent); background: var(--accent-soft); }
+.wizard-step-activity {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.wizard-step-config {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  background: var(--bg-soft);
+}
+
 ::-webkit-scrollbar { width: 9px; height: 9px; }
 ::-webkit-scrollbar-thumb { background: #2c3444; border-radius: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }

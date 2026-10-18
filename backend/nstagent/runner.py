@@ -237,7 +237,13 @@ class BookRunner:
         try:
             if job == "outline":
                 await self._job_outline(planner_profile, config)
-                self._set_status(STATUS_IDLE)
+                # outline-only wizard mode auto-freezes and reports a clean
+                # "done"; interactive outline runs keep the idle status
+                if config.get("auto_freeze"):
+                    self._set_status(STATUS_DONE)
+                    await self._emit({"type": "runner_stopped", "reason": "outline-only"})
+                else:
+                    self._set_status(STATUS_IDLE)
             else:
                 await self._job_story(writer_profile, config)
                 if self.status == STATUS_WRITING:
@@ -288,6 +294,11 @@ class BookRunner:
             await self._emit({"type": "llm_stream", "phase": "end", "label": "Planner"})
         book = self.store.load_book(self.book_id)
         book["outline"] = outline
+        if config.get("auto_freeze"):
+            # wizard outline-only mode: freeze immediately so the writing step
+            # (and the outline refiner) can consume the outline right away
+            outline["frozen"] = True
+            book["status"] = "ready"
         self.store.save_book(book)
         await self._emit({"type": "outline_done", "chapters": len(outline.get("chapters", []))})
 

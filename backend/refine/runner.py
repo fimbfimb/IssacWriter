@@ -86,9 +86,14 @@ class RefineRunner:
     def _append_log(self, event: Dict[str, Any]) -> None:
         outdir = self.outdir
         kind = str(event.get("type") or "")
-        if outdir is None or not kind.startswith("refine_"):
+        if outdir is None or not (kind.startswith("refine_") or kind in ("llm_call", "wizard_candidates")):
             return
-        if kind == "refine_started":
+        if kind == "wizard_candidates":
+            line = (
+                f"candidates {', '.join(event.get('candidates') or [])} → winner "
+                f"{event.get('winner') or '?'} ({event.get('unit') or ''})"
+            )
+        elif kind == "refine_started":
             line = (
                 f"start — refine · draft {event.get('draft') or '?'}"
                 f" · refiner {event.get('refiner') or '?'}"
@@ -194,17 +199,30 @@ class RefineRunner:
     async def start(self, config: Dict[str, Any]) -> None:
         if self._task is not None and not self._task.done():
             raise RuntimeError("refinement already in progress")
-        draft = dict(config.get("draft") or {})
-        refiner = dict(config.get("refiner") or {})
+        candidates = [
+            dict(c)
+            for c in (config.get("candidates") or [])
+            if isinstance(c, dict) and c
+        ]
+        judge = dict(config.get("judge") or {}) if config.get("judge") else None
+        ensemble_active = len(candidates) >= 2
+        draft = dict(config.get("draft") or (candidates[0] if candidates else {}))
+        refiner = dict(config.get("refiner") or (candidates[0] if candidates else {}))
         checker = dict(config.get("checker") or {}) if config.get("checker") else None
-        if not draft:
-            raise RuntimeError("refine needs a draft profile")
-        if not draft.get("model"):
-            raise RuntimeError("the draft profile has no model configured")
-        if not refiner:
-            raise RuntimeError("refine needs a refiner profile (the strongest available model)")
-        if not refiner.get("model"):
-            raise RuntimeError("the refiner profile has no model configured")
+        if ensemble_active:
+            if any(not c.get("model") for c in candidates):
+                raise RuntimeError("a candidate profile has no model configured")
+            if judge and not judge.get("model"):
+                raise RuntimeError("the judge profile has no model configured")
+        else:
+            if not draft:
+                raise RuntimeError("refine needs a draft profile")
+            if not draft.get("model"):
+                raise RuntimeError("the draft profile has no model configured")
+            if not refiner:
+                raise RuntimeError("refine needs a refiner profile (the strongest available model)")
+            if not refiner.get("model"):
+                raise RuntimeError("the refiner profile has no model configured")
         if checker and not checker.get("model"):
             raise RuntimeError("the checker profile has no model configured")
 
@@ -228,14 +246,25 @@ class RefineRunner:
         self.interrupted = False
         self.language = str(config.get("language") or "English").strip() or "English"
         self.batch_words = self._clamp_int(config.get("batch_words") or DEFAULT_MIN_WORDS, DEFAULT_MIN_WORDS, 1, 5000)
-        self.profile_name = "refine (draft: {draft} · refiner: {refiner} · checker: {checker})".format(
-            draft=str(draft.get("name") or draft.get("model") or "?"),
-            refiner=str(refiner.get("name") or refiner.get("model") or "?"),
-            checker=str((checker or {}).get("name") or (checker or {}).get("model") or "—"),
-        )
-        self.model = ", ".join(
-            str(p.get("model")) for p in (draft, refiner, checker) if p and p.get("model")
-        )
+        if ensemble_active:
+            self.profile_name = "candidates (" + " · ".join(
+                str(c.get("name") or c.get("model")) for c in candidates
+            )
+            if judge:
+                self.profile_name += f" + judge {judge.get('name') or judge.get('model')}"
+            else:
+                self.profile_name += " (no judge)"
+            self.profile_name += ")"
+            self.model = ", ".join(str(c.get("model")) for c in candidates)
+        else:
+            self.profile_name = "refine (draft: {draft} · refiner: {refiner} · checker: {checker})".format(
+                draft=str(draft.get("name") or draft.get("model") or "?"),
+                refiner=str(refiner.get("name") or refiner.get("model") or "?"),
+                checker=str((checker or {}).get("name") or (checker or {}).get("model") or "—"),
+            )
+            self.model = ", ".join(
+                str(p.get("model")) for p in (draft, refiner, checker) if p and p.get("model")
+            )
 
         book_dir = self.store.root / self.book_id
         outdir = book_dir / "refines"
@@ -273,6 +302,9 @@ class RefineRunner:
         chapters: List[Dict[str, Any]],
         resume: bool,
     ) -> None:
+        candidates = [dict(c) for c in (config.get("candidates") or []) if isinstance(c, dict) and c]
+        ensemble_active = len(candidates) >= 2
+        judge = dict(config.get("judge") or {}) if config.get("judge") else None
         started_event: Dict[str, Any] = {
             "type": "refine_started",
             "mode": "refine",
@@ -285,6 +317,12 @@ class RefineRunner:
             "batches_words": self.batch_words,
             "chapters": [int(c["id"]) for c in chapters],
         }
+        if ensemble_active:
+            started_event["candidates"] = [
+                c.get("name") or c.get("model") for c in candidates
+            ]
+            started_event["judge"] = (judge or {}).get("name") or (judge or {}).get("model") if judge else None
+            started_event["parallel_candidates"] = bool(config.get("parallel_candidates"))
         await self._fire(started_event)
         try:
             summary = await run_refinement(
@@ -293,7 +331,13 @@ class RefineRunner:
                 draft_profile=draft,
                 refiner_profile=refiner,
                 checker_profile=checker,
-                unload_after_call=bool(config.get("unload_after_call", True)),
+                unload_after_call=(
+                    bool(config.get("unload_after_call", True))
+                    and not (ensemble_active and bool(config.get("parallel_candidates")))
+                ),
+                candidates=candidates if ensemble_active else None,
+                judge=judge if ensemble_active else None,
+                parallel_candidates=bool(config.get("parallel_candidates")) and ensemble_active,
                 refine_rounds=self._clamp_int(
                     config.get("refine_rounds"), DEFAULT_REFINE_ROUNDS, 1, 6
                 ),

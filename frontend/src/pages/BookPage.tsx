@@ -10,22 +10,25 @@ import TranslateTab from "../components/TranslateTab";
 import RefinerTab from "../components/RefinerTab";
 import LayoutTab from "../components/LayoutTab";
 import SequelDialog from "../components/SequelDialog";
+import WizardTab from "../components/WizardTab";
 
-type TabName = "outline" | "write" | "refine" | "translate" | "codex" | "layout" | "stats" | "models";
+type TabName = "wizard" | "outline" | "write" | "refine" | "translate" | "codex" | "layout" | "stats" | "models";
 
 export default function BookPage({
   bookId,
   onBack,
   onOpen,
   showToast,
+  initialTab,
 }: {
   bookId: string;
   onBack: () => void;
-  onOpen: (id: string) => void;
+  onOpen: (id: string, tab?: string) => void;
   showToast: (m: string) => void;
+  initialTab?: TabName | null;
 }) {
   const [book, setBook] = useState<Book | null>(null);
-  const [tab, setTab] = useState<TabName>("outline");
+  const [tab, setTab] = useState<TabName>(initialTab ?? "outline");
   const [events, setEvents] = useState<any[]>([]);
   const [runnerTick, setRunnerTick] = useState(0);
   const [sequelOpen, setSequelOpen] = useState(false);
@@ -47,7 +50,14 @@ export default function BookPage({
     const close = openEventStream(bookId, (event) => {
       setEvents((prev) => [...prev.slice(-500), event]);
       setRunnerTick((t) => t + 1);
-      if (["outline_done", "chapter_done", "runner_stopped", "runner_error", "translation_done", "translation_error", "refine_done", "refine_error", "outline_refine_done", "outline_refine_error"].includes(event.type)) {
+      if ([
+        "outline_done", "chapter_done", "runner_stopped", "runner_error",
+        "translation_done", "translation_error", "refine_done", "refine_error",
+        "outline_refine_done", "outline_refine_error",
+        "german_refine_done", "german_refine_error",
+        "wizard_step_started", "wizard_step_done", "wizard_step_error",
+        "wizard_paused", "wizard_resumed", "wizard_done", "wizard_stopped",
+      ].includes(event.type)) {
         refreshBook();
       }
     });
@@ -111,6 +121,9 @@ export default function BookPage({
       )}
 
       <div className="tabs">
+        <button className={`tab ${tab === "wizard" ? "active" : ""}`} onClick={() => setTab("wizard")}>
+          🧙 Wizard
+        </button>
         <button className={`tab ${tab === "outline" ? "active" : ""}`} onClick={() => setTab("outline")}>
           Outline
         </button>
@@ -137,6 +150,7 @@ export default function BookPage({
         </button>
       </div>
 
+      {tab === "wizard" && <WizardTab book={book} events={events} showToast={showToast} onOpen={onOpen} />}
       {tab === "outline" && <OutlineTab book={book} events={events} refreshBook={refreshBook} showToast={showToast} />}
       {tab === "write" && (
         <WriteTab book={book} events={events} refreshBook={refreshBook} showToast={showToast} />

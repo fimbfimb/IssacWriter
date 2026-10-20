@@ -424,7 +424,7 @@ export default function TranslateTab({
 
   return (
     <div>
-      {!toolReady && (
+      {mode === "tool" && !toolReady && (
         <div className="error-banner">
           Translation tool not installed. Run once:
           <pre style={{ margin: "6px 0 0" }}>

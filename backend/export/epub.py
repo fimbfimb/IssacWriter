@@ -30,8 +30,19 @@ h1 { text-align: center; margin-top: 22%; font-size: 1.9em; }
 h2 { margin-top: 1.6em; page-break-after: avoid; }
 p { text-indent: 1.2em; margin: 0 0 0.2em 0; text-align: justify; }
 p.first { text-indent: 0; }
-figure { margin: 1.2em 0 0 0; text-align: center; page-break-inside: avoid; }
-figure img { max-width: 92%; height: auto; }
+/* Illustration = full page plate: the image sits ALONE on its own page
+   (break before + after), the text resumes on the following page. */
+figure.plate {
+  margin: 0;
+  padding: 0;
+  text-align: center;
+  page-break-before: always;
+  page-break-after: always;
+  break-before: page;
+  break-after: page;
+  page-break-inside: avoid;
+}
+figure.plate img { max-width: 96%; height: auto; max-height: 90vh; object-fit: contain; }
 .cover-illustration { max-width: 100%; height: auto; margin: 0 auto; }
 """
 
@@ -78,24 +89,57 @@ def _xhtml_doc(title: str, body: str, lang: str) -> str:
     )
 
 
-def _chapter_body(
+def _chapter_doc_parts(
     chapter: Dict[str, Any], illustrations: List[Dict[str, Any]], image_names: Dict[str, str]
-) -> str:
-    parts = [f"<h2>{_esc(chapter_heading(chapter))}</h2>"]
+) -> List[Tuple[str, str]]:
+    """Chapter split into spine documents so each illustration becomes a hard
+    page boundary (readers ignore CSS breaks; spine documents never).
+
+    Returns [(filename, body)] in reading order:
+      chNNNN.xhtml     → heading + text before the first image
+      chNNNN-i01.xhtml → ONE illustration (full-page plate)
+      chNNNN-02.xhtml  → the following text, and so on
+    """
+    cid = int(chapter["id"])
     paragraphs = cleanup_paragraphs(chapter.get("content") or "")
     by_index: Dict[int, List[Dict[str, Any]]] = {}
     for illustration in illustrations:
         index = illustration.get("paragraph_index")
         if isinstance(index, int) and index >= 0 and illustration.get("id") in image_names:
             by_index.setdefault(index, []).append(illustration)
+
+    def _plate(illustration: Dict[str, Any]) -> str:
+        # no captions in the book — the image stands alone on its plate page
+        return (
+            "<figure class=\"plate\">"
+            f'<img src="images/{image_names[illustration["id"]]}" alt=""/>'
+            "</figure>"
+        )
+
+    documents: List[Tuple[str, str]] = []
+    text_buffer: List[str] = [f"<h2>{_esc(chapter_heading(chapter))}</h2>"]
+    text_seq = 1
+    un_indented = False
+
+    def _flush_text() -> None:
+        nonlocal text_buffer, text_seq
+        if not text_buffer:
+            return
+        filename = f"ch{cid:04d}.xhtml" if text_seq == 1 else f"ch{cid:04d}-{text_seq:02d}.xhtml"
+        documents.append((filename, "\n".join(text_buffer)))
+        text_buffer = []
+        text_seq += 1
+
     for index, paragraph in enumerate(paragraphs):
-        parts.append(f'<p class="{"first" if index == 0 else ""}">{_esc(paragraph)}</p>')
+        class_ = "first" if (index == 0 or un_indented) else ""
+        text_buffer.append(f'<p class="{class_}">{_esc(paragraph)}</p>')
+        un_indented = False
         for illustration in by_index.get(index, []):
-            caption = _esc(illustration.get("scene") or illustration.get("id"))
-            parts.append(
-                f'<figure><img src="images/{image_names[illustration["id"]]}" alt="{caption}"/></figure>'
-            )
-    return "\n".join(parts)
+            _flush_text()
+            documents.append((f"ch{cid:04d}-{illustration['id']}.xhtml", _plate(illustration)))
+            un_indented = True
+    _flush_text()
+    return documents
 
 
 def build_epub(
@@ -173,17 +217,22 @@ def build_epub(
         "Cover", f'<figure><img class="cover-illustration" src="images/{cover_file}" alt="Cover"/></figure>', language
     ) if cover_file else None
 
-    chapter_docs: Dict[int, str] = {}
+    # spine docs in reading order: per chapter, text segments interleaved with
+    # one full-page plate document per illustration
+    spine_docs: List[Tuple[str, str]] = []  # (filename, xml_doc)
+    segment_label: Dict[str, str] = {}  # filename → toc/manifest label (first segment only)
     for chapter in chapters:
         cid = int(chapter["id"])
         entries = by_chapter.get(cid, [])
         usable = [e for e in entries if str(e["id"]) in image_names]
-        chapter_docs[cid] = _xhtml_doc(chapter_heading(chapter), _chapter_body(chapter, usable, image_names), language)
+        for filename, body in _chapter_doc_parts(chapter, usable, image_names):
+            spine_docs.append((filename, _xhtml_doc(chapter_heading(chapter), body, language)))
+            segment_label.setdefault(filename, chapter_heading(chapter))
 
-    toc = [(f"ch{cid:04d}.xhtml", chapter_heading(ch)) for ch in chapters for cid in [int(ch["id"])]]
     nav_body = '<nav epub:type="toc" id="toc"><h1>Inhaltsverzeichnis</h1>\n<ol>\n'
-    for href, label in toc:
-        nav_body += f'<li><a href="{_esc(href)}">{_esc(label)}</a></li>\n'
+    for chapter in chapters:
+        cid = int(chapter["id"])
+        nav_body += f'<li><a href="ch{cid:04d}.xhtml">{_esc(chapter_heading(chapter))}</a></li>\n'
     nav_body += "</ol></nav>\n"
     nav_doc = _xhtml_doc("Inhaltsverzeichnis", nav_body, language)
 
@@ -193,8 +242,9 @@ def build_epub(
         f'    <item id="doc-nav" href="nav.xhtml" media-type="{MIME_XHTML}" properties="nav"/>',
         f'    <item id="css" href="style.css" media-type="{MIME_CSS}"/>',
     ]
-    for cid in sorted(chapter_docs):
-        manifest.append(f'    <item id="doc-ch{cid:04d}" href="ch{cid:04d}.xhtml" media-type="{MIME_XHTML}"/>')
+    for filename, _body in spine_docs:
+        doc_id = "doc-" + filename[:-6]  # ch0000 → doc-ch0000 / ch0000-i01 → doc-ch0000-i01
+        manifest.append(f'    <item id="{doc_id}" href="{_esc(filename)}" media-type="{MIME_XHTML}"/>')
     if cover_doc:
         manifest.append(f'    <item id="doc-cover" href="cover.xhtml" media-type="{MIME_XHTML}"/>')
     for illustration_id in sorted(image_names):
@@ -207,7 +257,9 @@ def build_epub(
     spine = ["    <itemref idref=\"doc-title\"/>"]
     if cover_file:
         spine.append('    <itemref idref="doc-cover"/>')
-    spine += [f'    <itemref idref="doc-ch{cid:04d}"/>' for cid in sorted(chapter_docs)]
+    for filename, _body in spine_docs:
+        doc_id = "doc-" + filename[:-6]
+        spine.append(f'    <itemref idref="{doc_id}"/>')
     spine.append('    <itemref idref="doc-nav" linear="no"/>')
 
     modified = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -248,8 +300,8 @@ def build_epub(
         if cover_doc:
             archive.writestr("OEBPS/cover.xhtml", cover_doc)
         archive.writestr("OEBPS/nav.xhtml", nav_doc)
-        for cid, document in chapter_docs.items():
-            archive.writestr(f"OEBPS/ch{cid:04d}.xhtml", document)
+        for filename, document in spine_docs:
+            archive.writestr(f"OEBPS/{filename}", document)
         for name, data in bytes_by_name.items():
             archive.writestr(f"OEBPS/images/{name}", data)
     return buffer.getvalue(), warnings

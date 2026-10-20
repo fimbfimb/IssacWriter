@@ -28,6 +28,23 @@ _BLANK_LINES = re.compile(r"\n{3,}")
 _END_HYPHEN = re.compile(r"-$")
 _WRAP_JOIN = re.compile(r"[ \t]*\n[ \t]*")
 
+# models leak markdown emphasis (**bold**, *italics*, __underline__) into
+# prose — a printed book never carries asterisks, so they dissolve. Applied
+# twice: "**a **b** c**" nests one pair inside another.
+_EM_BOLD = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+_EM_BOLD_UNDER = re.compile(r"__(.+?)__", re.DOTALL)
+# single asterisks: only when digit-UNflanked ("5*3"/"2 * x" is math, not prose)
+_EM_ITALIC = re.compile(r"(?<!\d)\*([^*\n]+?)\*(?!\d)")
+_EM_UNDER = re.compile(r"(?<![\w_])_([^_\n]+?)_(?![\w_])")
+_ORPHAN_MARKS = re.compile(r"\*\*")
+
+
+def _strip_emphasis(text: str) -> str:
+    for pattern in (_EM_BOLD, _EM_BOLD_UNDER, _EM_ITALIC, _EM_UNDER):
+        for _ in range(3):  # nested pairs need a second pass
+            text = pattern.sub(r"\1", text)
+    return _ORPHAN_MARKS.sub("", text)
+
 
 def _next_nonspace(text: str, index: int) -> str:
     index = max(0, index)
@@ -65,8 +82,10 @@ def _dash_only_line(line: str) -> bool:
 
 
 def cleanup_text(text: str) -> str:
-    """Normalize dashes, blank lines and trailing whitespace in a manuscript."""
+    """Normalize markdown emphasis, dashes, blank lines and trailing whitespace
+    in a manuscript."""
     text = (text or "").replace("\r\n", "\n")
+    text = _strip_emphasis(text)
     text = _DASH_TOKEN.sub(_replace_dash, text)
     lines: List[str] = []
     for line in text.split("\n"):

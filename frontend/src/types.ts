@@ -369,6 +369,13 @@ export type WizardBookConfig = {
   codex_min: Codex | null;
 };
 
+export type WizardWorkerState = {
+  slot?: number;
+  role?: string;
+  detail?: string;
+  since?: number;
+};
+
 export type WizardStepState = {
   step: number;
   kind: WizardStepKind;
@@ -377,6 +384,7 @@ export type WizardStepState = {
   finished_at: string | null;
   error: string | null;
   progress: { done: number; total: number | null; frozen?: boolean };
+  workers?: Array<WizardWorkerState | null> | null;
   engine?: {
     status: string | null;
     error: string | null;

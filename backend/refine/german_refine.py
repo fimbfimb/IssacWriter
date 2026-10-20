@@ -254,6 +254,7 @@ class GermanRefineRunner:
         self.source_chapters: List[int] = []
         self.activity: Optional[Dict[str, Any]] = None
         self.last_activity: Optional[float] = None
+        self.workers: List[Optional[Dict[str, Any]]] = []  # per slot: {role, detail, since}
 
     def bind_emit(self, emit: Callable[[Dict[str, Any]], Awaitable[None]]) -> None:
         self._emit = emit
@@ -277,10 +278,25 @@ class GermanRefineRunner:
                 }
             else:
                 self.activity = None
+            parallel_worker = event.get("worker")
+            slot = int(parallel_worker) if parallel_worker is not None else 0
+            while len(self.workers) <= slot:
+                self.workers.append(None)
+            if kind == "llm_call" and event.get("phase") == "start":
+                self.workers[slot] = {
+                    "slot": slot + 1,
+                    "role": str(event.get("role") or "?"),
+                    "detail": str(event.get("detail") or ""),
+                    "since": time.time(),
+                }
+            elif kind == "llm_call":
+                self.workers[slot] = None
         self._mirror_current_file()
         if self._emit is not None:
             try:
-                await self._emit(event)
+                # same hardening as the refine runner: a stalled subscriber may
+                # not hold the runner task hostage
+                await asyncio.wait_for(self._emit(event), timeout=5.0)
             except Exception:
                 pass
         self._append_log(event)
@@ -370,6 +386,7 @@ class GermanRefineRunner:
             "source_chapters": list(self.source_chapters),
             "activity": self.activity,
             "last_activity": self.last_activity,
+            "workers": [w for w in self.workers],
         }
 
     def _save_meta(self) -> None:
@@ -540,6 +557,7 @@ class GermanRefineRunner:
                 ratio_max=1.5,
                 min_words=self.batch_words,
                 max_words=None,
+                parallel_blocks=self._clamp_int(config.get("parallel_blocks"), 1, 1, 8),
                 style_probe=str(config.get("style_probe") or ""),
                 outdir=self.outdir or workdir(fallback_slug),
                 refined_dir=self.refined or refined_dir(fallback_slug),

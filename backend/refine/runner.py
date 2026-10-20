@@ -59,6 +59,7 @@ class RefineRunner:
         self.refined_dir: Optional[Path] = None
         self.activity: Optional[Dict[str, Any]] = None
         self.last_activity: Optional[float] = None
+        self.workers: List[Optional[Dict[str, Any]]] = []  # per parallel slot: {role, detail, since}
 
     def bind_emit(self, emit: Callable[[Dict[str, Any]], Awaitable[None]]) -> None:
         """Merge refine events into the shared book event stream."""
@@ -76,9 +77,26 @@ class RefineRunner:
                 }
             else:
                 self.activity = None
+        if event.get("worker") is not None:
+            # per-slot view for the parallel refine: which worker does WHAT
+            slot = int(event["worker"])
+            while len(self.workers) <= slot:
+                self.workers.append(None)
+            if kind == "llm_call" and event.get("phase") == "start":
+                self.workers[slot] = {
+                    "slot": slot + 1,
+                    "role": str(event.get("role") or "?"),
+                    "detail": str(event.get("detail") or ""),
+                    "since": time.time(),
+                }
+            elif kind == "llm_call":
+                self.workers[slot] = None
         if self._emit is not None:
             try:
-                await self._emit(event)
+                # the shared event fan-out must never hold the runner hostage —
+                # a stalled subscriber froze the runner task (task_alive stayed
+                # True after a stop and the wizard reported busy on everything)
+                await asyncio.wait_for(self._emit(event), timeout=5.0)
             except Exception:
                 pass
         self._append_log(event)
@@ -170,6 +188,7 @@ class RefineRunner:
             "task_alive": bool(self._task is not None and not self._task.done()),
             "activity": self.activity,
             "last_activity": self.last_activity,
+            "workers": [w for w in self.workers],
         }
 
     def _save_meta(self) -> None:
@@ -351,6 +370,7 @@ class RefineRunner:
                 ratio_max=self._clamp_float(config.get("ratio_max"), DEFAULT_RATIO_MAX, 0.5, 5.0),
                 min_words=self.batch_words,
                 max_words=None,
+                parallel_blocks=self._clamp_int(config.get("parallel_blocks"), 1, 1, 8),
                 style_probe=str(config.get("style_probe") or ""),
                 outdir=self.outdir or (self.store.root / self.book_id / "refines"),
                 refined_dir=self.refined_dir

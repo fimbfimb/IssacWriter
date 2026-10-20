@@ -18,7 +18,7 @@ function defaultStepConfigs(): WizardStepConfig[] {
     { step: 1, kind: "outline", enabled: true, planner_profile_id: "" },
     { step: 2, kind: "outline_refine", enabled: true, candidate_profile_ids: [], judge_profile_id: "", parallel: false, refine_rounds: 1, similarity_stop: 0.95, context_prev: 3 },
     { step: 3, kind: "write", enabled: true, writer_profile_id: "" },
-    { step: 4, kind: "text_refine", enabled: true, candidate_profile_ids: [], judge_profile_id: "", parallel: false, refine_rounds: 2, similarity_stop: 0.97, draft_temperature: 0.7, style_probe: "" },
+    { step: 4, kind: "text_refine", enabled: true, candidate_profile_ids: [], judge_profile_id: "", parallel: false, refine_rounds: 1, similarity_stop: 0.97, draft_temperature: 0.7, style_probe: "" },
     { step: 5, kind: "translate", enabled: true, draft_profile_id: "", refiner_profile_id: "", checker_profile_id: "", target_language: "German", batch_words: 250, style_probe: "" },
     { step: 6, kind: "translate_refine", enabled: true, candidate_profile_ids: [], judge_profile_id: "", parallel: false, refine_rounds: 1 },
   ];
@@ -642,6 +642,41 @@ function WizardConfigEditor({
           />
         </div>
         {singleField(step, "judge_profile_id" as keyof WizardStepConfig, "Judge")}
+        <div className="form-col" style={{ minWidth: 110 }}>
+          <label>Runden</label>
+          <input
+            type="number"
+            min={1}
+            max={3}
+            step={1}
+            value={(row as any).refine_rounds ?? ""}
+            onChange={(e) => setField(step, "refine_rounds", e.target.value === "" ? "" : Number(e.target.value))}
+            onBlur={(e) => {
+              const raw = Number(e.target.value);
+              if (!raw || raw < 1) setField(step, "refine_rounds", 1);
+            }}
+          />
+        </div>
+        <div className="form-col" style={{ minWidth: 120 }}>
+          <label>Parallel-Blöcke</label>
+          <input
+            type="number"
+            min={1}
+            max={8}
+            step={1}
+            value={(row as any).parallel_blocks ?? ""}
+            onChange={(e) => setField(step, "parallel_blocks", e.target.value === "" ? "" : Number(e.target.value))}
+            onBlur={(e) => {
+              const raw = Number(e.target.value);
+              if (!raw || raw < 1) setField(step, "parallel_blocks", 1);
+            }}
+          />
+          <div className="inline-note" style={{ fontSize: 10.5 }}>
+            1 = seriell (Tonanker aus dem verfeinerten Vorgängerblock). Mehr als 1 = Kapitel gleichzeitig (je Worker
+            ein Kapitel) — der Tonanker kommt dann aus der Original-Prosa. Eingaben werden beim Speichern begrenzt
+            (Runden 1-3, Blöcke 1-8).
+          </div>
+        </div>
       </>
     );
   };

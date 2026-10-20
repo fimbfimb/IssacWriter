@@ -103,6 +103,7 @@ class TranslationRunner:
         self.refined_fallback: List[int] = []
         self.activity: Optional[Dict[str, Any]] = None
         self.last_activity: Optional[float] = None
+        self.workers: List[Optional[Dict[str, Any]]] = []  # per slot: {role, detail, since}
 
     def bind_emit(self, emit: Callable[[Dict[str, Any]], Awaitable[None]]) -> None:
         """Merge translation events into the shared book event stream (SSE/log)."""
@@ -120,9 +121,25 @@ class TranslationRunner:
                 }
             else:
                 self.activity = None
+            # single-worker slot view (sequential translation): show WHAT runs
+            slot = 0
+            while len(self.workers) <= slot:
+                self.workers.append(None)
+            if event.get("phase") == "start":
+                self.workers[slot] = {
+                    "slot": 1,
+                    "role": str(event.get("role") or "?"),
+                    "detail": str(event.get("detail") or ""),
+                    "since": time.time(),
+                }
+            else:
+                self.workers[slot] = None
         if self._emit is not None:
             try:
-                await self._emit(event)
+                # a stalled event subscriber must never hold the runner task
+                # hostage (this froze the runner after 'done', the wizard then
+                # reported busy on everything)
+                await asyncio.wait_for(self._emit(event), timeout=5.0)
             except Exception:
                 pass
         self._append_log(event)
@@ -187,6 +204,8 @@ class TranslationRunner:
                 line += f" · {event['review_flags']} flag(s), {event.get('annotations') or 0} note(s) → review_list.md"
             if event.get("gaps"):
                 line += f" · {event['gaps']} block(s) failed"
+        elif kind == "translation_retry":
+            line = "↻ Wiederversuch — " + str(event.get("note") or f"{event.get('gaps') or 0} block(s) failed")
         elif kind == "translation_error":
             line = (
                 "error — "
@@ -218,6 +237,7 @@ class TranslationRunner:
             "refined_fallback": list(self.refined_fallback),
             "activity": self.activity,
             "last_activity": self.last_activity,
+            "workers": list(self.workers),
             "tool": tool_status(),
         }
 
@@ -258,9 +278,9 @@ class TranslationRunner:
                 raise RuntimeError("authorial mode needs a draft profile")
             if not draft.get("model"):
                 raise RuntimeError("the draft profile has no model configured")
-            if not refiner:
-                raise RuntimeError("authorial mode needs a refiner profile (the strongest available model)")
-            if not refiner.get("model"):
+            # the refiner is OPTIONAL — without it the drafts go straight into
+            # refined/ and the S6 step does the quality pass
+            if refiner and not refiner.get("model"):
                 raise RuntimeError("the refiner profile has no model configured")
             if checker and not checker.get("model"):
                 raise RuntimeError("the checker profile has no model configured")
@@ -589,8 +609,9 @@ class TranslationRunner:
         resume: bool,
     ) -> None:
         min_words = self._clamp_int(config.get("batch_words") or DEFAULT_MIN_WORDS, DEFAULT_MIN_WORDS, 1, 5000)
-        try:
-            summary = await run_authorial_translation(
+
+        async def _authorial_pass(resume_flag: bool):
+            return await run_authorial_translation(
                 chapters=chapters,
                 language=self.language,
                 draft_profile=dict(config.get("draft") or {}),
@@ -613,12 +634,35 @@ class TranslationRunner:
                 style_probe=str(config.get("style_probe") or ""),
                 outdir=self.outdir or (self.store.root / self.book_id / "translations"),
                 book=self.store.load_book(self.book_id),
-                resume=resume,
+                resume=resume_flag,
                 structured=bool(config.get("structured", True)),
                 check_mode=(str(config.get("check_mode") or "essential").lower() if str(config.get("check_mode") or "essential").lower() in ("essential", "strict") else "essential"),
                 emit=self._fire,
                 should_stop=lambda: self._stop_requested,
             )
+
+        try:
+            summary = await _authorial_pass(resume)
+            # END-OF-RUN RETRY: blocks that failed get ONE new pass; the report
+            # keeps finished stages, so the retry re-runs ONLY the failures
+            retry_pass = 0
+            while (
+                (summary or {}).get("gaps")
+                and retry_pass < 1
+                and not self._stop_requested
+            ):
+                retry_pass += 1
+                await self._fire(
+                    {
+                        "type": "translation_retry",
+                        "gaps": int(summary["gaps"]),
+                        "note": (
+                            f"{int(summary['gaps'])} block(s) failed — "
+                            f"retry pass {retry_pass} re-translates only those"
+                        ),
+                    }
+                )
+                summary = await _authorial_pass(True)
         except TranslationStopped:
             self.finished_at = time.time()
             self.status = STATUS_STOPPED

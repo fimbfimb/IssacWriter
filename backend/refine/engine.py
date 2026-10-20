@@ -63,7 +63,7 @@ from ..translation.ensemble import (
 )
 
 DRAFT_TEMPERATURE = 0.7
-DEFAULT_REFINE_ROUNDS = 2
+DEFAULT_REFINE_ROUNDS = 1
 DEFAULT_SIMILARITY_STOP = 0.97
 DEFAULT_RATIO_MIN = 0.75
 DEFAULT_RATIO_MAX = 1.5
@@ -662,6 +662,7 @@ async def run_refinement(
     candidates: Optional[List[Dict[str, Any]]] = None,
     judge: Optional[Dict[str, Any]] = None,
     parallel_candidates: bool = False,
+    parallel_blocks: int = 1,
     emit: Callable[[Dict[str, Any]], Awaitable[None]],
     should_stop: Callable[[], bool],
     client_factory: Optional[Callable[[Dict[str, Any]], Any]] = None,
@@ -691,6 +692,7 @@ async def run_refinement(
     batches = build_word_batches(chapters, min_words=min_words, max_words=max_words)
     refine_rounds = max(1, int(refine_rounds))
     similarity_stop = min(1.0, max(0.0, float(similarity_stop)))
+    parallel_blocks = max(1, min(8, int(parallel_blocks or 1)))
     check_mode = check_mode if check_mode in CHECK_MODES else CHECK_MODE_ESSENTIAL
 
     draft_name = str(draft_profile.get("name") or draft_profile.get("model") or "draft")
@@ -825,343 +827,337 @@ async def run_refinement(
     active_refiner_client = refiner_client
     active_refiner_name = refiner_name
     unload_between_candidates = not parallel_candidates
-    _unload = _make_unload(unload_after_call)
-    try:
-        for index, batch in enumerate(batches):
-            if should_stop():
-                writer.persist({**meta, "interrupted": True}, book.get("title") or "")
-                raise TranslationStopped()
-            restored = writer.finished[index] if index < len(writer.finished) else None
-            entry = restored
-            stage = (entry or {}).get("stage")
-            source_block = writer.source_for(batch)
+    # one worker per parallel block — a shared local model must not be evicted
+    # mid-flight by a peer's unload, so per-call unloading only happens
+    # sequentially; parallel runs unload every used profile once at the end
+    _unload = _make_unload(unload_after_call and parallel_blocks <= 1)
 
-            # ---- Stufe 1: Entwurf ------------------------------------------
-            active_refiner_profile = refiner_profile
-            active_refiner_client = refiner_client
-            active_refiner_name = refiner_name
-            if stage not in ("drafted", "refined", "done"):
-                if ensemble_active:
-                    produced: List[Dict[str, Any]] = []
-                    cand_errors: List[str] = []
+    # tone anchor per block IN SOURCE space: the last paragraph of the
+    # previous block of the same chapter. Sequential runs keep the refined
+    # chain (writer.last_paragraph()); parallel runs cannot see a concurrent
+    # neighbor's output, so the matching source paragraph carries the tone.
+    _source_anchor: List[Optional[str]] = []
+    _last_by_chapter: Dict[int, str] = {}
+    for batch in batches:
+        _source_anchor.append(_last_by_chapter.get(batch["chapter_id"]))
+        paragraphs_ = batch["paragraphs"] or []
+        if paragraphs_:
+            text_ = paragraphs_[-1].strip()
+            if text_:
+                _last_by_chapter[batch["chapter_id"]] = text_
 
-                    async def _run_candidate(
-                        cand_index: int, cand_profile: Dict[str, Any], cand_client: Any, do_unload: bool
-                    ) -> Optional[Dict[str, Any]]:
-                        cand_name = str(
-                            cand_profile.get("name") or cand_profile.get("model") or f"Kandidat {cand_index + 1}"
-                        )
-                        cand_detail = (
-                            f"Kapitel {batch['chapter_id'] + 1} · Block {index + 1}/{len(batches)} "
-                            f"(Entwurf Kandidat {cand_index + 1}/{len(candidates)})"
-                        )
-                        try:
-                            cand_text, cand_notes, cand_usage = await signal_call(
-                                emit,
-                                cand_name,
-                                cand_detail,
-                                lambda: call_structured(
-                                    cand_client,
-                                    draft_messages(
-                                        source_block, language, book, writer.last_paragraph(), style_probe
-                                    ),
-                                    draft_temperature,
-                                    structured=structured,
-                                ),
-                            )
-                            _accumulate(cand_name, _role_usage(cand_usage))
-                            if do_unload:
-                                await _unload(cand_profile)
-                            return {
-                                "name": cand_name,
-                                "profile": cand_profile,
-                                "client": cand_client,
-                                "text": cand_text,
-                                "notes": cand_notes,
-                            }
-                        except Exception as exc:
-                            cand_errors.append(f"{cand_name}: {exc}")
-                            if do_unload:
-                                await _unload(cand_profile)
-                            return None
+    async def _process_batch(index: int, previous_anchor: Optional[str], slot: int = 0) -> None:
+        batch = batches[index]
+        if should_stop():
+            writer.persist({**meta, "interrupted": True}, book.get("title") or "")
+            raise TranslationStopped()
+        restored = writer.finished[index] if index < len(writer.finished) else None
+        entry = restored
+        stage = (entry or {}).get("stage")
+        source_block = writer.source_for(batch)
 
-                    if parallel_candidates:
-                        cand_results = await asyncio.gather(
-                            *[
-                                _run_candidate(c_index, cand, candidate_clients[c_index], False)
-                                for c_index, cand in enumerate(candidates)
-                            ],
-                            return_exceptions=True,
-                        )
-                        for cand, result in zip(candidates, cand_results):
-                            if isinstance(result, Exception):
-                                cand_errors.append(f"{cand.get('name') or cand.get('model')}: {result}")
-                            elif result is not None:
-                                produced.append(result)
-                        if unload_after_call:
-                            for cand in candidates:
-                                await _unload(cand)
-                    else:
-                        for c_index, cand in enumerate(candidates):
-                            if should_stop():
-                                writer.persist({**meta, "interrupted": True}, book.get("title") or "")
-                                raise TranslationStopped()
-                            result = await _run_candidate(c_index, cand, candidate_clients[c_index], True)
-                            if result is not None:
-                                produced.append(result)
+        # ---- Stufe 1: Entwurf ------------------------------------------
+        active_refiner_profile = refiner_profile
+        active_refiner_client = refiner_client
+        active_refiner_name = refiner_name
+        if stage not in ("drafted", "refined", "done"):
+            if ensemble_active:
+                produced: List[Dict[str, Any]] = []
+                cand_errors: List[str] = []
 
-                    if not produced:
-                        entry = {
-                            "index": index,
-                            "chapter_id": batch["chapter_id"],
-                            "chapter_name": batch["chapter_name"],
-                            "source_hash": batch["source_hash"],
-                            "source_block": source_block,
-                            "source_paragraphs": batch["paragraphs"],
-                            "stage": "draft",
-                            "draft_error": "; ".join(cand_errors) or "all candidate drafts failed",
-                            "draft_text": "",
-                            "draft_notes": [],
-                            "heading": None,
-                            "items": [],
-                            "review": [],
-                            "errors": [
-                                "draft: " + ("; ".join(cand_errors) or "all candidate drafts failed")
-                            ],
-                        }
-                        writer.set_entry(index, entry)
-                        writer.persist(meta, book.get("title") or "")
-                        await emit(
-                            {
-                                "type": "refine_batch",
-                                "batch_index": index + 1,
-                                "batches_total": len(batches),
-                                "chapter_id": batch["chapter_id"],
-                                "stage": "draft",
-                                "error": "; ".join(cand_errors) or "all candidate drafts failed",
-                            }
-                        )
-                        continue
-
-                    decision = {"winner": 1, "reason": ""}
-                    if judge_client is not None and len(produced) >= 2:
-                        if should_stop():
-                            writer.persist({**meta, "interrupted": True}, book.get("title") or "")
-                            raise TranslationStopped()
-                        try:
-                            j_response = await signal_call(
-                                emit,
-                                judge_name or "Judge",
-                                f"Kapitel {batch['chapter_id'] + 1} · Block {index + 1}/{len(batches)} · Rewrite-Judge",
-                                lambda: judge_client.chat(
-                                    refine_judge_messages(source_block, produced, language, book),
-                                    temperature=0.2,
-                                    max_output_tokens=1200,
-                                ),
-                            )
-                            decision = _parse_judge_decision(j_response.content or "", len(produced))
-                            _accumulate(judge_name or "Judge", _role_usage(j_response.usage))
-                        except Exception as exc:
-                            decision = _parse_judge_decision("", len(produced))
-                            decision["reason"] = f"judge failed ({exc}); defaulted"
-                        await _unload(judge or {})
-                    winner = produced[max(1, int(decision["winner"])) - 1]
-                    text = winner["text"]
-                    notes = winner["notes"]
-                    draft_winner_name = winner["name"]
-                    if refiner_profile is None:
-                        active_refiner_profile = winner["profile"]
-                        active_refiner_client = winner["client"]
-                        active_refiner_name = winner["name"]
-                    await emit(
-                        {
-                            "type": "wizard_candidates",
-                            "unit": f"block {index + 1}",
-                            "chapter_id": batch["chapter_id"],
-                            "candidates": [p["name"] for p in produced],
-                            "winner": draft_winner_name,
-                            "reason": str(decision.get("reason") or ""),
-                        }
+                async def _run_candidate(
+                    cand_index: int, cand_profile: Dict[str, Any], cand_client: Any, do_unload: bool
+                ) -> Optional[Dict[str, Any]]:
+                    cand_name = str(
+                        cand_profile.get("name") or cand_profile.get("model") or f"Kandidat {cand_index + 1}"
                     )
-                else:
+                    cand_detail = (
+                        f"Kapitel {batch['chapter_id'] + 1} · Block {index + 1}/{len(batches)} "
+                        f"(Entwurf Kandidat {cand_index + 1}/{len(candidates)})"
+                    )
                     try:
-                        text, notes, usage_struct = await signal_call(
+                        cand_text, cand_notes, cand_usage = await signal_call(
                             emit,
-                            draft_name,
-                            f"Kapitel {batch['chapter_id'] + 1} · Block {index + 1}/{len(batches)}",
+                            cand_name,
+                            cand_detail,
                             lambda: call_structured(
-                                draft_client,
+                                cand_client,
                                 draft_messages(
-                                    source_block, language, book, writer.last_paragraph(), style_probe
+                                    source_block, language, book, previous_anchor, style_probe
                                 ),
                                 draft_temperature,
                                 structured=structured,
                             ),
+                            worker=slot,
                         )
-                        _accumulate(draft_name, _role_usage(usage_struct))
-                        await _unload(draft_profile)
-                    except Exception as exc:
-                        entry = {
-                            "index": index,
-                            "chapter_id": batch["chapter_id"],
-                            "chapter_name": batch["chapter_name"],
-                            "source_hash": batch["source_hash"],
-                            "source_block": source_block,
-                            "source_paragraphs": batch["paragraphs"],
-                            "stage": "draft",
-                            "draft_error": f"{draft_name}: {exc}",
-                            "draft_text": "",
-                            "draft_notes": [],
-                            "heading": None,
-                            "items": [],
-                            "review": [],
-                            "errors": [f"draft: {exc}"],
+                        _accumulate(cand_name, _role_usage(cand_usage))
+                        if do_unload:
+                            await _unload(cand_profile)
+                        return {
+                            "name": cand_name,
+                            "profile": cand_profile,
+                            "client": cand_client,
+                            "text": cand_text,
+                            "notes": cand_notes,
                         }
-                        writer.set_entry(index, entry)
-                        await _unload(draft_profile)
-                        writer.persist(meta, book.get("title") or "")
-                        await emit(
-                            {
-                                "type": "refine_batch",
-                                "batch_index": index + 1,
-                                "batches_total": len(batches),
-                                "chapter_id": batch["chapter_id"],
-                                "stage": "draft",
-                                "error": str(exc),
-                            }
-                        )
-                        continue
-                segments = split_paragraphs(text)
-                heading = None
-                expected = len(batch["paragraphs"]) + (1 if batch.get("header") else 0)
-                if batch.get("header") and len(segments) == expected:
-                    heading, segments = segments[0], segments[1:]
-                entry = {
-                    "index": index,
-                    "chapter_id": batch["chapter_id"],
-                    "chapter_name": batch["chapter_name"],
-                    "source_hash": batch["source_hash"],
-                    "source_block": source_block,
-                    "source_paragraphs": batch["paragraphs"],
-                    "stage": "drafted",
-                    "draft_error": None,
-                    "draft_text": text,
-                    "draft_notes": notes,
-                    "heading": heading,
-                    "segments": segments,
-                    "items": [],
-                    "review": [
-                        {"type": "annotation", "paragraph": None, "detail": note}
-                        for note in notes
-                    ],
-                    "errors": [],
-                }
-                if ensemble_active:
-                    entry["draft_candidates"] = [p["name"] for p in produced]
-                    entry["draft_winner"] = draft_winner_name
-                    entry["draft_judge_reason"] = str(decision.get("reason") or "")
-                    entry["draft_candidate_errors"] = list(cand_errors)
-                writer.set_entry(index, entry)
-                writer.persist(meta, book.get("title") or "")
-                stage = "drafted"
-                await emit(
-                    {
-                        "type": "refine_batch",
-                        "batch_index": index + 1,
-                        "batches_total": len(batches),
-                        "chapter_id": batch["chapter_id"],
-                        "stage": "draft",
-                        "notes": len(notes),
-                    }
-                )
-                await emit(
-                    {
-                        "type": "refine_output",
-                        "lines": [f"[{draft_winner_name if ensemble_active else draft_name}] {_first_line(text)}"],
-                    }
-                )
+                    except Exception as exc:
+                        cand_errors.append(f"{cand_name}: {exc}")
+                        if do_unload:
+                            await _unload(cand_profile)
+                        return None
 
-            # ---- Stufe 2: Verfeinern ---------------------------------------
-            if entry["stage"] == "drafted":
-                source_paragraphs: List[str] = entry.get("source_paragraphs") or []
-                segments: List[str] = (
-                    entry.get("segments")
-                    or split_paragraphs(entry.get("draft_text") or "")
-                    if not entry.get("items")
-                    else [i.get("text") or "" for i in entry.get("items")]
-                )
-                aligned = len(segments) == len(source_paragraphs)
-                if aligned:
-                    pairs = list(zip(source_paragraphs, segments))
-                else:
-                    _review_note(
-                        entry,
-                        "structure",
-                        None,
-                        f"paragraph count deviates (source {len(source_paragraphs)}, "
-                        f"draft {len(segments)}) — block refined as one text",
+                if parallel_candidates:
+                    cand_results = await asyncio.gather(
+                        *[
+                            _run_candidate(c_index, cand, candidate_clients[c_index], False)
+                            for c_index, cand in enumerate(candidates)
+                        ],
+                        return_exceptions=True,
                     )
-                    pairs = [(entry.get("source_block") or "", " ".join(segments))]
-                items: List[Dict[str, Any]] = []
-                previous = writer.last_paragraph()
-                for p_index, (para_source, para_text) in enumerate(pairs):
+                    for cand, result in zip(candidates, cand_results):
+                        if isinstance(result, Exception):
+                            cand_errors.append(f"{cand.get('name') or cand.get('model')}: {result}")
+                        elif result is not None:
+                            produced.append(result)
+                    if unload_after_call:
+                        for cand in candidates:
+                            await _unload(cand)
+                else:
+                    for c_index, cand in enumerate(candidates):
+                        if should_stop():
+                            writer.persist({**meta, "interrupted": True}, book.get("title") or "")
+                            raise TranslationStopped()
+                        result = await _run_candidate(c_index, cand, candidate_clients[c_index], True)
+                        if result is not None:
+                            produced.append(result)
+
+                if not produced:
+                    entry = {
+                        "index": index,
+                        "chapter_id": batch["chapter_id"],
+                        "chapter_name": batch["chapter_name"],
+                        "source_hash": batch["source_hash"],
+                        "source_block": source_block,
+                        "source_paragraphs": batch["paragraphs"],
+                        "stage": "draft",
+                        "draft_error": "; ".join(cand_errors) or "all candidate drafts failed",
+                        "draft_text": "",
+                        "draft_notes": [],
+                        "heading": None,
+                        "items": [],
+                        "review": [],
+                        "errors": [
+                            "draft: " + ("; ".join(cand_errors) or "all candidate drafts failed")
+                        ],
+                    }
+                    writer.set_entry(index, entry)
+                    writer.persist(meta, book.get("title") or "")
+                    await emit(
+                        {
+                            "type": "refine_batch",
+                            "batch_index": index + 1,
+                            "batches_total": len(batches),
+                            "chapter_id": batch["chapter_id"],
+                            "stage": "draft",
+                            "error": "; ".join(cand_errors) or "all candidate drafts failed",
+                        }
+                    )
+                    return
+
+                decision = {"winner": 1, "reason": ""}
+                if judge_client is not None and len(produced) >= 2:
                     if should_stop():
-                        # partial items must NOT become a "refined" stage — the
-                        # batch stays draft-backed so a resume re-runs the whole
-                        # block and no half-paragraph chapter can be committed
-                        entry["items"] = []
-                        entry["stage"] = "drafted"
                         writer.persist({**meta, "interrupted": True}, book.get("title") or "")
                         raise TranslationStopped()
-                    item: Dict[str, Any] = {
-                        "index": p_index,
-                        "source": para_source,
-                        "text": para_text,
-                        "rounds": 0,
-                        "notes": [],
-                        "error": None,
-                        "kept_draft": False,
-                        "stopped_early": False,
-                        "length_ratio": None,
-                        "fidelity": None,
+                    try:
+                        j_response = await signal_call(
+                            emit,
+                            judge_name or "Judge",
+                            f"Kapitel {batch['chapter_id'] + 1} · Block {index + 1}/{len(batches)} · Rewrite-Judge",
+                            lambda: judge_client.chat(
+                                refine_judge_messages(source_block, produced, language, book),
+                                temperature=0.2,
+                                max_output_tokens=1200,
+                            ),
+                            worker=slot,
+                        )
+                        decision = _parse_judge_decision(j_response.content or "", len(produced))
+                        _accumulate(judge_name or "Judge", _role_usage(j_response.usage))
+                    except Exception as exc:
+                        decision = _parse_judge_decision("", len(produced))
+                        decision["reason"] = f"judge failed ({exc}); defaulted"
+                    await _unload(judge or {})
+                winner = produced[max(1, int(decision["winner"])) - 1]
+                text = winner["text"]
+                notes = winner["notes"]
+                draft_winner_name = winner["name"]
+                if refiner_profile is None:
+                    active_refiner_profile = winner["profile"]
+                    active_refiner_client = winner["client"]
+                    active_refiner_name = winner["name"]
+                await emit(
+                    {
+                        "type": "wizard_candidates",
+                        "unit": f"block {index + 1}",
+                        "chapter_id": batch["chapter_id"],
+                        "candidates": [p["name"] for p in produced],
+                        "winner": draft_winner_name,
+                        "reason": str(decision.get("reason") or ""),
                     }
-                    for round_no in range(1, refine_rounds + 1):
-                        try:
-                            refined, note_lines, usage_struct = await signal_call(
-                                emit,
-                                active_refiner_name,
-                                f"Kapitel {batch['chapter_id'] + 1} · ¶{p_index + 1}/{len(pairs)} · Runde {round_no}/{refine_rounds}",
-                                lambda: call_structured(
-                                    active_refiner_client,
-                                    refine_messages(
-                                        para_source, previous, item["text"], language, book
-                                    ),
-                                    REFINE_TEMPERATURE,
-                                    structured=structured,
-                                ),
-                            )
-                            _accumulate(active_refiner_name, _role_usage(usage_struct))
-                            await _unload(active_refiner_profile)
-                        except Exception as exc:
-                            await _unload(active_refiner_profile)
-                            item["error"] = str(exc)
-                            item["kept_draft"] = True
-                            _review_note(
-                                entry,
-                                "refiner",
-                                p_index,
-                                f"refinement failed at round {round_no} ({exc}) — draft kept",
-                            )
-                            break
-                        ratio = similar_ratio(item["text"], refined)
-                        item["text"] = refined
-                        item["rounds"] = round_no
-                        for note in note_lines:
-                            item["notes"].append(note)
-                            _review_note(entry, "annotation", p_index, note, echo_against=refined)
-                        if ratio >= similarity_stop:
-                            item["stopped_early"] = True
-                            break
+                )
+            else:
+                try:
+                    text, notes, usage_struct = await signal_call(
+                        emit,
+                        draft_name,
+                        f"Kapitel {batch['chapter_id'] + 1} · Block {index + 1}/{len(batches)}",
+                        lambda: call_structured(
+                            draft_client,
+                            draft_messages(
+                                source_block, language, book, previous_anchor, style_probe
+                            ),
+                            draft_temperature,
+                            structured=structured,
+                        ),
+                        worker=slot,
+                    )
+                    _accumulate(draft_name, _role_usage(usage_struct))
+                    await _unload(draft_profile)
+                except Exception as exc:
+                    entry = {
+                        "index": index,
+                        "chapter_id": batch["chapter_id"],
+                        "chapter_name": batch["chapter_name"],
+                        "source_hash": batch["source_hash"],
+                        "source_block": source_block,
+                        "source_paragraphs": batch["paragraphs"],
+                        "stage": "draft",
+                        "draft_error": f"{draft_name}: {exc}",
+                        "draft_text": "",
+                        "draft_notes": [],
+                        "heading": None,
+                        "items": [],
+                        "review": [],
+                        "errors": [f"draft: {exc}"],
+                    }
+                    writer.set_entry(index, entry)
+                    await _unload(draft_profile)
+                    writer.persist(meta, book.get("title") or "")
+                    await emit(
+                        {
+                            "type": "refine_batch",
+                            "batch_index": index + 1,
+                            "batches_total": len(batches),
+                            "chapter_id": batch["chapter_id"],
+                            "stage": "draft",
+                            "error": str(exc),
+                        }
+                    )
+                    return
+
+            segments = split_paragraphs(text)
+            heading = None
+            expected = len(batch["paragraphs"]) + (1 if batch.get("header") else 0)
+            if batch.get("header") and len(segments) == expected:
+                heading, segments = segments[0], segments[1:]
+            entry = {
+                "index": index,
+                "chapter_id": batch["chapter_id"],
+                "chapter_name": batch["chapter_name"],
+                "source_hash": batch["source_hash"],
+                "source_block": source_block,
+                "source_paragraphs": batch["paragraphs"],
+                "stage": "drafted",
+                "draft_error": None,
+                "draft_text": text,
+                "draft_notes": notes,
+                "heading": heading,
+                "segments": segments,
+                "items": [],
+                "review": [
+                    {"type": "annotation", "paragraph": None, "detail": note}
+                    for note in notes
+                ],
+                "errors": [],
+            }
+            if ensemble_active:
+                entry["draft_candidates"] = [p["name"] for p in produced]
+                entry["draft_winner"] = draft_winner_name
+                entry["draft_judge_reason"] = str(decision.get("reason") or "")
+                entry["draft_candidate_errors"] = list(cand_errors)
+            writer.set_entry(index, entry)
+            writer.persist(meta, book.get("title") or "")
+            stage = "drafted"
+            await emit(
+                {
+                    "type": "refine_batch",
+                    "batch_index": index + 1,
+                    "batches_total": len(batches),
+                    "chapter_id": batch["chapter_id"],
+                    "stage": "draft",
+                    "notes": len(notes),
+                }
+            )
+            await emit(
+                {
+                    "type": "refine_output",
+                    "lines": [f"[{draft_winner_name if ensemble_active else draft_name}] {_first_line(text)}"],
+                }
+            )
+
+        # ---- Stufe 2: Verfeinern ---------------------------------------
+        if entry["stage"] == "drafted":
+            source_paragraphs: List[str] = entry.get("source_paragraphs") or []
+            segments: List[str] = (
+                entry.get("segments")
+                or split_paragraphs(entry.get("draft_text") or "")
+                if not entry.get("items")
+                else [i.get("text") or "" for i in entry.get("items")]
+            )
+            aligned = len(segments) == len(source_paragraphs)
+            if aligned:
+                pairs = list(zip(source_paragraphs, segments))
+            else:
+                _review_note(
+                    entry,
+                    "structure",
+                    None,
+                    f"paragraph count deviates (source {len(source_paragraphs)}, "
+                    f"draft {len(segments)}) — block refined as one text",
+                )
+                pairs = [(entry.get("source_block") or "", " ".join(segments))]
+            items: List[Dict[str, Any]] = []
+            previous = previous_anchor
+            for p_index, (para_source, para_text) in enumerate(pairs):
+                if should_stop():
+                    # partial items must NOT become a "refined" stage — the
+                    # batch stays draft-backed so a resume re-runs the whole
+                    # block and no half-paragraph chapter can be committed
+                    entry["items"] = []
+                    entry["stage"] = "drafted"
+                    writer.persist({**meta, "interrupted": True}, book.get("title") or "")
+                    raise TranslationStopped()
+                item: Dict[str, Any] = {
+                    "index": p_index,
+                    "source": para_source,
+                    "text": para_text,
+                    "rounds": 0,
+                    "notes": [],
+                    "error": None,
+                    "kept_draft": False,
+                    "stopped_early": False,
+                    "length_ratio": None,
+                    "fidelity": None,
+                }
+                # POLISH-GATE: the draft carried this paragraph over
+                # unchanged (same-language ratio ≈ 1) and flagged nothing —
+                # the draft model already treated it as final, so the
+                # polish round would be a no-op. Skip it.
+                gate_ratio = similar_ratio(para_text, para_source)
+                if not entry.get("draft_notes") and gate_ratio >= similarity_stop:
+                    item["kept_draft"] = True
+                    item["stopped_early"] = True
+                    item["length_ratio"] = gate_ratio
                     previous = item["text"]
                     items.append(item)
                     entry["items"] = items
@@ -1174,22 +1170,78 @@ async def run_refinement(
                             "chapter_id": batch["chapter_id"],
                             "paragraph": p_index + 1,
                             "paragraphs_total": len(pairs),
-                            "rounds": item["rounds"],
-                            "stopped_early": bool(item["stopped_early"]),
+                            "rounds": 0,
+                            "stopped_early": True,
                         }
                     )
-                entry["stage"] = "refined"
+                    continue
+                for round_no in range(1, refine_rounds + 1):
+                    try:
+                        refined, note_lines, usage_struct = await signal_call(
+                            emit,
+                            active_refiner_name,
+                            f"Kapitel {batch['chapter_id'] + 1} · ¶{p_index + 1}/{len(pairs)} · Runde {round_no}/{refine_rounds}",
+                            lambda: call_structured(
+                                active_refiner_client,
+                                refine_messages(
+                                    para_source, previous, item["text"], language, book
+                                ),
+                                REFINE_TEMPERATURE,
+                                structured=structured,
+                            ),
+                            worker=slot,
+                        )
+                        _accumulate(active_refiner_name, _role_usage(usage_struct))
+                        await _unload(active_refiner_profile)
+
+                    except Exception as exc:
+                        await _unload(active_refiner_profile)
+                        item["error"] = str(exc)
+                        item["kept_draft"] = True
+                        _review_note(
+                            entry,
+                            "refiner",
+                            p_index,
+                            f"refinement failed at round {round_no} ({exc}) — draft kept",
+                        )
+                        break
+                    ratio = similar_ratio(item["text"], refined)
+                    item["text"] = refined
+                    item["rounds"] = round_no
+                    for note in note_lines:
+                        item["notes"].append(note)
+                        _review_note(entry, "annotation", p_index, note, echo_against=refined)
+                    if ratio >= similarity_stop:
+                        item["stopped_early"] = True
+                        break
+                previous = item["text"]
+                items.append(item)
+                entry["items"] = items
                 writer.persist(meta, book.get("title") or "")
                 await emit(
                     {
-                        "type": "refine_batch",
+                        "type": "refine_progress",
                         "batch_index": index + 1,
                         "batches_total": len(batches),
                         "chapter_id": batch["chapter_id"],
-                        "stage": "refine",
-                        "paragraphs": len(items),
+                        "paragraph": p_index + 1,
+                        "paragraphs_total": len(pairs),
+                        "rounds": item["rounds"],
+                        "stopped_early": bool(item["stopped_early"]),
                     }
                 )
+            entry["stage"] = "refined"
+            writer.persist(meta, book.get("title") or "")
+            await emit(
+                {
+                    "type": "refine_batch",
+                    "batch_index": index + 1,
+                    "batches_total": len(batches),
+                    "chapter_id": batch["chapter_id"],
+                    "stage": "refine",
+                    "paragraphs": len(items),
+                }
+            )
 
             # ---- Stufe 3: Prüfen + Kapitel-Commit ---------------------------
             if entry["stage"] == "refined":
@@ -1222,6 +1274,7 @@ async def run_refinement(
                                     _refine_check_messages(src_text, refined_text),
                                     temperature=0.0,
                                 ),
+                                worker=slot,
                             )
                             verdict = parse_fidelity(response.content or "")
                             _accumulate(checker_name or "checker", _role_usage(response.usage))
@@ -1261,17 +1314,114 @@ async def run_refinement(
                         for row in flag_rows[:_MAX_REVIEW_LINES_EMITTED]
                     ]
                     await emit({"type": "refine_output", "lines": lines})
-                committed = writer.maybe_commit(index, meta)
-                if committed and not committed.get("duplicate"):
-                    await emit(
-                        {
-                            "type": "refine_chapter",
-                            "chapter_id": committed["chapter_id"],
-                            "version": committed["version"],
-                            "words": committed.get("words") or 0,
-                            "note": f"chapter committed as version v{committed['version']:04d}",
-                        }
-                    )
+                # chapter commit works across workers: whichever parallel block
+                # completes the chapter first sweeps it
+                for committed in _commit_sweep():
+                    if committed and not committed.get("duplicate"):
+                        await emit(
+                            {
+                                "type": "refine_chapter",
+                                "chapter_id": committed["chapter_id"],
+                                "version": committed["version"],
+                                "words": committed.get("words") or 0,
+                                "note": f"chapter committed as version v{committed['version']:04d}",
+                            }
+                        )
+
+    def _commit_sweep() -> List[Dict[str, Any]]:
+        """Commit every chapter whose blocks are ALL done — re-checked per
+        chapter against the known batch list (NOT just the entries currently
+        in self.finished: a parallel neighbor's entry may not exist yet, and
+        committing at that point produced half-finished versions). Commit
+        itself is idempotent per run."""
+        rows: List[Dict[str, Any]] = []
+        chapter_indices: Dict[int, List[int]] = {}
+        for batch_index, batch_ in enumerate(batches):
+            chapter_indices.setdefault(batch_["chapter_id"], []).append(batch_index)
+        for chapter_id, indices in sorted(chapter_indices.items()):
+            all_done = all(
+                int(index) < len(writer.finished)
+                and (writer.finished[int(index)] or {}).get("stage") == "done"
+                for index in indices
+            )
+            if not all_done:
+                continue
+            committed = writer.commit_version(chapter_id, meta)
+            if committed:
+                rows.append(committed)
+        return rows
+
+    try:
+        if parallel_blocks > 1:
+            # WORKERS TAKE WHOLE CHAPTERS: one worker runs all blocks of one
+            # chapter sequentially (identical tone-chain quality to the serial
+            # run), the other workers work other chapters in parallel.
+            chapter_groups: Dict[int, List[int]] = {}
+            for index, batch_ in enumerate(batches):
+                chapter_groups.setdefault(batch_["chapter_id"], []).append(index)
+            groups = [chapter_groups[cid] for cid in sorted(chapter_groups)]
+
+            # refined tone tail per chapter: block N's anchor = block N-1's
+            # refined last paragraph; first block falls back to the source
+            # anchor, then the global refined tail (serial-equivalent)
+            queue: asyncio.Queue = asyncio.Queue()
+            for group_index in range(len(groups)):
+                queue.put_nowait(group_index)
+            worker_count = min(parallel_blocks, len(groups))
+            for _ in range(worker_count):
+                queue.put_nowait(None)  # clean shutdown signal
+            stopped = {"flag": False}
+            chapter_tails: Dict[int, Optional[str]] = {}
+
+            async def _worker(worker_id: int) -> None:
+                slot = worker_id - 1
+                while True:
+                    group_index = await queue.get()
+                    if group_index is None:
+                        queue.task_done()
+                        return
+                    try:
+                        if stopped["flag"] or should_stop():
+                            stopped["flag"] = True
+                            return
+                        for index in groups[group_index]:
+                            cid = batches[index]["chapter_id"]
+                            anchor = chapter_tails.get(cid) or _source_anchor[index]
+                            await _process_batch(index, anchor, slot=slot)
+                            entry = (
+                                writer.finished[index]
+                                if index < len(writer.finished)
+                                else None
+                            )
+                            for item in reversed(entry.get("items") or []):
+                                text = (item.get("text") or "").strip()
+                                if text:
+                                    chapter_tails[cid] = text
+                                    break
+                    except TranslationStopped:
+                        stopped["flag"] = True
+                    finally:
+                        queue.task_done()
+
+            block_workers = [
+                asyncio.ensure_future(_worker(worker_id))
+                for worker_id in range(1, worker_count + 1)
+            ]
+            try:
+                await asyncio.gather(*block_workers)
+            finally:
+                for task in block_workers:
+                    task.cancel()
+                await asyncio.gather(*block_workers, return_exceptions=True)
+            if stopped["flag"]:
+                writer.persist({**meta, "interrupted": True}, book.get("title") or "")
+                raise TranslationStopped()
+        else:
+            for index in range(len(batches)):
+                if should_stop():
+                    writer.persist({**meta, "interrupted": True}, book.get("title") or "")
+                    raise TranslationStopped()
+                await _process_batch(index, writer.last_paragraph())
 
         writer.persist(
             {
@@ -1304,6 +1454,14 @@ async def run_refinement(
             "refine_rounds_total": rounds_total,
         }
     finally:
+        if parallel_blocks > 1 and unload_after_call:
+            final_unload = _make_unload(True)
+            for profile in [draft_profile, refiner_profile, checker_profile, judge, *candidates]:
+                if profile:
+                    try:
+                        await final_unload(profile)
+                    except Exception:
+                        pass  # the model eviction must never mask a real error
         for client in (draft_client, refiner_client, checker_client, judge_client, *candidate_clients):
             if client is not None:
                 close = getattr(client, "aclose", None)

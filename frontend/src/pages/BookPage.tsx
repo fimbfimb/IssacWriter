@@ -11,8 +11,9 @@ import RefinerTab from "../components/RefinerTab";
 import LayoutTab from "../components/LayoutTab";
 import SequelDialog from "../components/SequelDialog";
 import WizardTab from "../components/WizardTab";
+import ExportTab from "../components/ExportTab";
 
-type TabName = "wizard" | "outline" | "write" | "refine" | "translate" | "codex" | "layout" | "stats" | "models";
+type TabName = "wizard" | "outline" | "write" | "refine" | "translate" | "codex" | "layout" | "stats" | "models" | "export";
 
 export default function BookPage({
   bookId,
@@ -145,6 +146,9 @@ export default function BookPage({
         <button className={`tab ${tab === "stats" ? "active" : ""}`} onClick={() => setTab("stats")}>
           Statistics
         </button>
+        <button className={`tab ${tab === "export" ? "active" : ""}`} onClick={() => setTab("export")}>
+          📤 Export
+        </button>
         <button className={`tab ${tab === "models" ? "active" : ""}`} onClick={() => setTab("models")}>
           LLM Profiles
         </button>
@@ -164,6 +168,7 @@ export default function BookPage({
       {tab === "layout" && <LayoutTab book={book} showToast={showToast} />}
       {tab === "codex" && <CodexTab book={book} refreshBook={refreshBook} showToast={showToast} />}
       {tab === "stats" && <StatsTab book={book} showToast={showToast} />}
+      {tab === "export" && <ExportTab book={book} showToast={showToast} />}
       {tab === "models" && <ProfilesTab showToast={showToast} />}
 
       {sequelOpen && (

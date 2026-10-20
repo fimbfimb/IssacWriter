@@ -1,4 +1,4 @@
-import type { WizardState, WizardStepState } from "../types";
+import type { WizardState, WizardStepState, WizardWorkerState } from "../types";
 
 const STEP_LABELS: Record<number, string> = {
   1: "Outline",
@@ -103,7 +103,11 @@ export default function WizardProgressBoard({
         {state.steps_state.map((row) => {
           const percent = stepPercent(row);
           const activity = activityText(row);
+          const workers = (row.workers ?? []).filter(
+            (w): w is WizardWorkerState => Boolean(w && w.detail),
+          );
           return (
+            <>
             <div key={row.step} className={`wizard-step-row${state.current_step === row.step ? " active" : ""}`}>
               <span style={{ minWidth: 210, display: "inline-flex", gap: 8, alignItems: "center" }}>
                 <strong style={{ fontSize: 12.5 }}>
@@ -130,6 +134,27 @@ export default function WizardProgressBoard({
                 <span style={{ minWidth: 66 }} />
               )}
             </div>
+            {workers.length > 0 ? (
+              <div key={`${row.step}-workers`} style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", margin: "2px 0 6px 218px" }}>
+                {workers.map((worker) => (
+                  <span
+                    key={worker.slot ?? Math.random()}
+                    className="chip status-writing"
+                    style={{ fontSize: 11, fontVariantNumeric: "tabular-nums" }}
+                    title={worker.detail}
+                  >
+                    🧰 Worker {worker.slot}: {worker.detail}
+                    {worker.since ? (
+                      <span style={{ opacity: 0.75 }}>
+                        {" "}
+                        · {Math.max(0, Math.round(Date.now() / 1000 - worker.since))}s
+                      </span>
+                    ) : null}
+                  </span>
+                ))}
+              </div>
+            ) : null}
+            </>
           );
         })}
       </div>

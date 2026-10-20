@@ -1,4 +1,4 @@
-"""Wizard orchestration: a per-book state machine driving the 6 novel steps.
+﻿"""Wizard orchestration: a per-book state machine driving the 6 novel steps.
 
 The wizard owns NO engine logic — every step is started through the existing
 registries (RunnerRegistry, OutlineRefineRegistry, RefineRegistry,
@@ -282,8 +282,9 @@ class WizardRunner:
             if cfg is None:
                 continue
             for key, value in row.items():
-                if key != "step":
-                    cfg[key] = value
+                if key in ("step", "kind") or value is None:
+                    continue  # a None value (unset field) must never clobber cfg
+                cfg[key] = value
         self._history("config updated while paused")
         self._save()
         return None
@@ -533,12 +534,27 @@ class WizardRunner:
     async def _wait_refine_runner(
         self, runner: Any, step_row: Dict[str, Any], report_relpath: Optional[str] = None
     ) -> Optional[str]:
+        settle_deadline: Optional[float] = None
+        last_workers: Any = None
         while True:
             await asyncio.sleep(POLL_INTERVAL)
             meta = runner._meta()
             status = str(meta.get("status") or "")
             if meta.get("task_alive"):
+                workers = meta.get("workers") or []
+                if workers != last_workers:
+                    step_row["workers"] = workers
+                    last_workers = workers
+                    self._save()
+                if status in ("stopped", "error", "idle", "done"):
+                    # runner says settled but its task lingers — give it 60s,
+                    # then treat the step as settled instead of waiting forever
+                    settle_deadline = settle_deadline or (time.time() + 60)
+                if settle_deadline and time.time() > settle_deadline:
+                    step_row["status"] = STEP_PAUSED
+                    return None
                 continue
+            settle_deadline = None
             if status == "done":
                 gaps = _report_gap_count(_report(self.book_dir, report_relpath)) if report_relpath else None
                 if gaps:
@@ -587,7 +603,7 @@ class WizardRunner:
         judge = None
         if cfg.get("judge_profile_id"):
             judge = self._resolve_profile(cfg.get("judge_profile_id"), "judge")
-        rounds = int(cfg.get("refine_rounds") or 2)
+        rounds = int(cfg.get("refine_rounds") or 1)
         config: Dict[str, Any] = {
             "candidates": candidates,
             "judge": judge,
@@ -598,6 +614,7 @@ class WizardRunner:
             "refine_rounds": max(1, min(3, rounds)),
             "similarity_stop": float(cfg.get("similarity_stop") or 0.97),
             "batch_words": 250,
+            "parallel_blocks": max(1, min(8, int(cfg.get("parallel_blocks") or 1))),
         }
         if cfg.get("draft_temperature"):
             config["draft_temperature"] = float(cfg.get("draft_temperature"))
@@ -617,7 +634,13 @@ class WizardRunner:
             return f"translation busy in status {runner.status}"
         book = self.store.load_book(self.book_id)
         draft = self._resolve_profile(cfg.get("draft_profile_id"), "translation draft")
-        refiner = self._resolve_profile(cfg.get("refiner_profile_id"), "translation refiner")
+        # refiner is OPTIONAL: without it the drafts go straight into refined/
+        # and the S6 step (translate_refine) does the quality pass
+        refiner = (
+            self._resolve_profile(cfg.get("refiner_profile_id"), "translation refiner")
+            if cfg.get("refiner_profile_id")
+            else None
+        )
         checker = (
             self._resolve_profile(cfg["checker_profile_id"], "translation checker")
             if cfg.get("checker_profile_id")
@@ -642,12 +665,25 @@ class WizardRunner:
         except RuntimeError as exc:
             return str(exc)
         # wait until done/sim finished
+        settle_deadline: Optional[float] = None
+        last_workers: Any = None
         while True:
             await asyncio.sleep(POLL_INTERVAL)
             meta = runner._meta()
             status = str(meta.get("status") or "")
             if meta.get("task_alive"):
+                workers = meta.get("workers") or []
+                if workers != last_workers:
+                    step_row["workers"] = workers
+                    last_workers = workers
+                    self._save()
+                if status in ("stopped", "error", "idle", "done"):
+                    settle_deadline = settle_deadline or (time.time() + 60)
+                if settle_deadline and time.time() > settle_deadline:
+                    step_row["status"] = STEP_PAUSED
+                    return None
                 continue
+            settle_deadline = None
             if status == "done":
                 return None
             if status == "stopped":
@@ -695,16 +731,30 @@ class WizardRunner:
             "similarity_stop": 0.97,
             "batch_words": int(cfg5.get("batch_words") or 250),
             "style_probe": str(cfg5.get("style_probe") or ""),
+            "parallel_blocks": max(1, min(8, int(cfg.get("parallel_blocks") or 1))),
         }
         try:
             await runner.start(config)
         except RuntimeError as exc:
             return str(exc)
+        settle_deadline: Optional[float] = None
+        last_workers: Any = None
         while True:
             await asyncio.sleep(POLL_INTERVAL)
             meta = runner._meta()
             status = str(meta.get("status") or "")
             if meta.get("task_alive"):
+                workers = meta.get("workers") or []
+                if workers != last_workers:
+                    step_row["workers"] = workers
+                    last_workers = workers
+                    self._save()
+                if status in ("stopped", "error", "idle"):
+                    # runner says settled but its task lingers — don't wait forever
+                    settle_deadline = settle_deadline or (time.time() + 60)
+                if settle_deadline and time.time() > settle_deadline:
+                    step_row["status"] = STEP_PAUSED
+                    return None
                 continue
             if status == "done":
                 gaps = _report_gap_count(

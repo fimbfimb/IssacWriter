@@ -223,13 +223,14 @@ class OutlineRefineSelectIn(BaseModel):
 
 class WizardStepIn(BaseModel):
     step: int
-    kind: str
+    kind: Optional[str] = None  # required for CREATE; optional for PATCH
     enabled: bool = True
     planner_profile_id: Optional[str] = None
     writer_profile_id: Optional[str] = None
     candidate_profile_ids: List[str] = Field(default_factory=list)
     judge_profile_id: Optional[str] = None
     parallel: bool = False
+    parallel_blocks: Optional[int] = None
     refine_rounds: Optional[int] = None
     similarity_stop: Optional[float] = None
     context_prev: Optional[int] = None
@@ -1591,7 +1592,10 @@ def create_app() -> FastAPI:
         steps: List[Dict[str, Any]] = []
         for kind in (row["kind"] for row in wizard_state.default_steps()):
             row = dict(defaults[kind])
-            supplied = next((s for s in payload_steps if s.kind == kind), None)
+            supplied = next(
+                (s for s in payload_steps if s.kind == kind or s.step == row["step"]),
+                None,
+            )
             if supplied is not None:
                 data = supplied.model_dump()
                 for key in supplied.model_fields_set:
@@ -1641,8 +1645,6 @@ def create_app() -> FastAPI:
             elif kind == "translate":
                 if not row.get("draft_profile_id"):
                     raise HTTPException(400, "Step 5 (translate): draft_profile_id required")
-                if not row.get("refiner_profile_id"):
-                    raise HTTPException(400, "Step 5 (translate): refiner_profile_id required")
         enabled_kinds = [row["kind"] for row in steps if row.get("enabled", True)]
         if not enabled_kinds:
             raise HTTPException(400, "enable at least one step")
@@ -1678,7 +1680,6 @@ def create_app() -> FastAPI:
                 _check(candidate_id, f"candidate {index + 1}")
             if kind == "translate":
                 _check(row.get("draft_profile_id"), "translation draft")
-                _check(row.get("refiner_profile_id"), "translation refiner")
                 _check(row.get("checker_profile_id"), "translation checker")
         return steps
 
@@ -1807,6 +1808,18 @@ def create_app() -> FastAPI:
     async def wizard_patch_config(book_id: str, payload: WizardConfigPatchIn):
         get_book_or_404(book_id)
         patch = payload.model_dump(exclude_none=True)
+        # only the EXPLICITLY submitted step fields — a full model_dump would
+        # clobber untouched config (empty candidate lists reset the profiles!)
+        steps_patch = []
+        for supplied in payload.steps or []:
+            row = {"step": supplied.step, "kind": supplied.kind}
+            dump = supplied.model_dump(exclude_none=True)
+            for key in supplied.model_fields_set:
+                if key in ("step", "kind"):
+                    continue
+                row[key] = dump.get(key)
+            steps_patch.append(row)
+        patch["steps"] = steps_patch
         error = wizards.get(book_id).apply_config_patch(patch)
         if error:
             raise HTTPException(409, error)

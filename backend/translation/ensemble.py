@@ -158,34 +158,41 @@ async def signal_call(
     role: str,
     detail: str,
     call: Callable[[], Awaitable[Any]],
+    worker: Optional[int] = None,
 ) -> Any:
     """Lifecycle wrapper for ONE LLM call: emits llm_call start/done/error and
     returns the call result. Used by all engines so the UI can show that a
-    model is working between stage events."""
-    await emit({"type": "llm_call", "phase": "start", "role": role, "detail": detail})
+    model is working between stage events. `worker` = parallel worker slot
+    (0..n) so the UI can show WHICH of the parallel workers is doing this call."""
+    payload = {"type": "llm_call", "phase": "start", "role": role, "detail": detail}
+    if worker is not None:
+        payload["worker"] = int(worker)
+    await emit(payload)
     began = time.time()
     try:
         result = await call()
     except Exception as exc:
-        await emit(
-            {
-                "type": "llm_call",
-                "phase": "error",
-                "role": role,
-                "detail": detail,
-                "elapsed_s": round(time.time() - began, 1),
-            }
-        )
-        raise
-    await emit(
-        {
+        payload = {
             "type": "llm_call",
-            "phase": "done",
+            "phase": "error",
             "role": role,
             "detail": detail,
             "elapsed_s": round(time.time() - began, 1),
         }
-    )
+        if worker is not None:
+            payload["worker"] = int(worker)
+        await emit(payload)
+        raise
+    payload = {
+        "type": "llm_call",
+        "phase": "done",
+        "role": role,
+        "detail": detail,
+        "elapsed_s": round(time.time() - began, 1),
+    }
+    if worker is not None:
+        payload["worker"] = int(worker)
+    await emit(payload)
     return result
 
 

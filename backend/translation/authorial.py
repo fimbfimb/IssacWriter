@@ -1310,6 +1310,11 @@ async def run_authorial_translation(
                     pairs = [(entry.get("source_block") or "", " ".join(segments))]
                 items: List[Dict[str, Any]] = []
                 previous = writer.last_paragraph()
+                # no refiner configured → the DRAFT goes straight into
+                # refined/ (a later step, e.g. the S6 German refine, is then
+                # responsible for the quality pass). Without the model the
+                # polish loop would run a client into the openai-API void.
+                refiner_active = bool(refiner_profile.get("model"))
                 for p_index, (para_source, para_text) in enumerate(pairs):
                     if should_stop():
                         entry["items"] = items
@@ -1328,6 +1333,25 @@ async def run_authorial_translation(
                         "length_ratio": None,
                         "fidelity": None,
                     }
+                    if not refiner_active:
+                        item["kept_draft"] = True
+                        previous = item["text"]
+                        items.append(item)
+                        entry["items"] = items
+                        writer.persist(meta, book.get("title") or "")
+                        await emit(
+                            {
+                                "type": "translate_progress",
+                                "batch_index": index + 1,
+                                "batches_total": len(batches),
+                                "chapter_id": batch["chapter_id"],
+                                "paragraph": p_index + 1,
+                                "paragraphs_total": len(pairs),
+                                "rounds": 0,
+                                "kept_draft": True,
+                            }
+                        )
+                        continue
                     for round_no in range(1, refine_rounds + 1):
                         try:
                             refined, note_lines, usage_struct = await signal_call(

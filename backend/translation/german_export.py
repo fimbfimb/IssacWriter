@@ -36,8 +36,26 @@ _ISO_CODES = {
 }
 
 # Kapitel/Chapter heading, also as Markdown line ("# ", "## …") — the
-# chapters_de files carry their heading sometimes with marker prefixes
-_HEADING = re.compile(r"^\s*(?:#{1,6}\s*)?(?:Kapitel|Chapter)\s+\d+\s*[:.]?\s*(.*)$", re.IGNORECASE)
+# chapters_de files carry their heading sometimes with marker prefixes.
+# Ordinal forms ("Erstes Kapitel: …") leak from the translator prose too, and
+# refiners wrap them in markdown bold ("**Erstes Kapitel: …**").
+_HEADING = re.compile(
+    r"^\s*(?:\*{1,2}\s*)?(?:#{1,6}\s*)?"
+    r"(?:(?:Kapitel|Chapter)\s+\d+|(?:Erst|Zweit|Dritt|Viert|F[üu]nft|Sechs|Siebt|Acht|Neunt|Zehnt)e[rsn]?\s+Kapitel)\s*[:.]?\s*"
+    r"(?P<title>.*?)\s*\*{0,2}\s*$",
+    re.IGNORECASE,
+)
+
+
+def _strip_heading(line: str) -> str:
+    match = _HEADING.match((line or "").strip())
+    return match.group("title").strip() if match else ""
+
+
+def _heading_match(line: str):
+    """Heading-shaped line (any form above) — used to purge heading rows from
+    the body even when they carry no recoverable title."""
+    return _HEADING.match((line or "").strip())
 
 
 def language_code(language: str) -> str:
@@ -168,12 +186,33 @@ def _clean_headings(chapters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         lines = [line for line in content.splitlines()]
         while lines and not lines[0].strip():
             lines.pop(0)
-        translated = _strip_heading(lines[0]) if lines else ""
-        if translated:
-            content = "\n".join(lines[1:]).strip()
-        name = re.sub(r"^\s*#{1,6}\s*", "", str(row.get("name") or "").strip())
-        if translated and translated != _strip_heading(name):
-            name = translated
+        # translation batches repeat the chapter heading INSIDE their prose
+        # (sometimes 2-3x, ordinal and markdown-bold forms included: "**Erstes
+        # Kapitel: …**") — every heading-shaped line dissolves; the first one
+        # names the h2
+        translated = ""
+        body_lines: List[str] = []
+        for line in lines:
+            match = _heading_match(line)
+            if match:
+                title = match.group("title").strip()
+                if title and not translated:
+                    translated = title
+                continue
+            body_lines.append(line)
+        while body_lines and not body_lines[0].strip():
+            body_lines.pop(0)
+        while body_lines and not body_lines[-1].strip():
+            body_lines.pop()
+        content = "\n".join(body_lines)
+        raw = str(row.get("name") or "").strip()
+        plain = _strip_heading(raw)
+        if plain:
+            name = plain  # "Kapitel 7: …"/"Erstes Kapitel: …"/"# …" — stripped
+        elif raw.startswith("#"):
+            name = re.sub(r"^\s*#{1,6}\s*", "", raw)
+        else:
+            name = translated or raw
         out.append({"id": int(row["id"]), "name": name, "content": content})
     return out
 

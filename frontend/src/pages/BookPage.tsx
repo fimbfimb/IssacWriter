@@ -29,7 +29,7 @@ export default function BookPage({
   initialTab?: TabName | null;
 }) {
   const [book, setBook] = useState<Book | null>(null);
-  const [tab, setTab] = useState<TabName>(initialTab ?? "outline");
+  const [tab, setTab] = useState<TabName>(initialTab ?? "wizard");
   const [events, setEvents] = useState<any[]>([]);
   const [runnerTick, setRunnerTick] = useState(0);
   const [sequelOpen, setSequelOpen] = useState(false);

@@ -33,7 +33,7 @@ function emptyCodexRows(): { characters: CodexMinRow[]; settings: CodexMinRow[] 
   };
 }
 
-function SingleProfileChips({
+function SingleProfileSelect({
   value,
   onChange,
   profiles,
@@ -44,31 +44,19 @@ function SingleProfileChips({
   profiles: Profile[];
   emptyLabel: string;
 }) {
-  // Klick-Auswahl wie bei den Kandidaten: an = gewählt, nochmal klick = abgewählt
   return (
-    <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-      {profiles.map((profile) => {
-        const active = value === profile.id;
-        return (
-          <button
-            key={profile.id}
-            type="button"
-            className={`chip${active ? " status-done" : ""} btn-ghost`}
-            style={{ padding: "4px 10px", borderColor: active ? "var(--good)" : undefined }}
-            onClick={() => onChange(active ? "" : profile.id)}
-            title={`${profile.name || profile.model} · ${profile.model}`}
-          >
-            {active ? "✔ " : ""}
-            {profile.name || profile.model}
-          </button>
-        );
-      })}
-      {!value ? <span className="muted" style={{ fontSize: 11.5, alignSelf: "center" }}>{emptyLabel}</span> : null}
-    </div>
+    <select value={value} onChange={(event) => onChange(event.target.value)}>
+      <option value="">— {emptyLabel} —</option>
+      {profiles.map((profile) => (
+        <option key={profile.id} value={profile.id} title={`${profile.model}`}>
+          {profile.name || profile.model} ({profile.model})
+        </option>
+      ))}
+    </select>
   );
 }
 
-function CandidatePicker({
+function CandidateSelect({
   ids,
   onChange,
   profiles,
@@ -79,31 +67,27 @@ function CandidatePicker({
   profiles: Profile[];
   max?: number;
 }) {
-  const toggle = (id: string) => {
-    if (ids.includes(id)) onChange(ids.filter((row) => row !== id));
-    else if (ids.length < max) onChange([...ids, id]);
-  };
   return (
-    <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-      {profiles.map((profile) => {
-        const active = ids.includes(profile.id);
-        return (
-          <button
-            key={profile.id}
-            type="button"
-            className={`chip${active ? " status-done" : ""} btn-ghost`}
-            style={{ padding: "4px 10px", borderColor: active ? "var(--good)" : undefined }}
-            onClick={() => toggle(profile.id)}
-          >
-            {active ? "✔ " : ""}
-            {profile.name || profile.model}
-          </button>
-        );
-      })}
-      <span className="muted" style={{ fontSize: 11.5, alignSelf: "center" }}>
-        {ids.length}/{max} Kandidaten (1–6)
+    <>
+      <select
+        multiple
+        size={Math.min(Math.max(profiles.length + 1, 3), 7)}
+        value={ids}
+        style={{ width: "100%" }}
+        onChange={(event) =>
+          onChange(Array.from(event.target.selectedOptions, (option) => option.value).slice(0, max))
+        }
+      >
+        {profiles.map((profile) => (
+          <option key={profile.id} value={profile.id} title={`${profile.model}`}>
+            {profile.name || profile.model} ({profile.model})
+          </option>
+        ))}
+      </select>
+      <span className="muted" style={{ fontSize: 11 }}>
+        {ids.length}/{max} gewählt — Strg/⌘-Klick für mehrere
       </span>
-    </div>
+    </>
   );
 }
 
@@ -439,20 +423,20 @@ function WizardConfigScreen({
                 </strong>
               </div>
 
-              <div className="form-row">
+              <div className="wizard-grid">
                 {row.kind === "outline" ? (
-                  <div className="form-col" style={{ minWidth: 320 }}>
-                    <label>Planner-Profil* (anklicken)</label>
-                    <SingleProfileChips value={row.planner_profile_id ?? ""} onChange={(id) => patchStep(row.step, { planner_profile_id: id })} profiles={profiles} emptyLabel="Profil wählen" />
+                  <div className="form-col" style={{ maxWidth: 340 }}>
+                    <label>Planner-Profil*</label>
+                    <SingleProfileSelect value={row.planner_profile_id ?? ""} onChange={(id) => patchStep(row.step, { planner_profile_id: id })} profiles={profiles} emptyLabel=" Profil wählen" />
                   </div>
                 ) : null}
                 {row.kind === "write" ? (
                   <>
-                    <div className="form-col" style={{ minWidth: 320 }}>
-                      <label>Writer-Profil* (anklicken)</label>
-                      <SingleProfileChips value={row.writer_profile_id ?? ""} onChange={(id) => patchStep(row.step, { writer_profile_id: id })} profiles={profiles} emptyLabel="Profil wählen" />
+                    <div className="form-col" style={{ maxWidth: 340 }}>
+                      <label>Writer-Profil*</label>
+                      <SingleProfileSelect value={row.writer_profile_id ?? ""} onChange={(id) => patchStep(row.step, { writer_profile_id: id })} profiles={profiles} emptyLabel=" Profil wählen" />
                     </div>
-                    <div className="form-col">
+                    <div className="form-col" style={{ flex: "1 1 200px", maxWidth: 280 }}>
                       <label>Laufmodus</label>
                       <input value="auto (Wizard erzwingt automatisch)" disabled />
                     </div>
@@ -460,45 +444,49 @@ function WizardConfigScreen({
                 ) : null}
                 {row.kind === "translate" ? (
                   <>
-                    <div className="form-col" style={{ minWidth: 260 }}>
-                      <label>Entwurfs-Profil* (anklicken)</label>
-                      <SingleProfileChips value={row.draft_profile_id ?? ""} onChange={(id) => patchStep(row.step, { draft_profile_id: id })} profiles={profiles} emptyLabel="Profil wählen" />
+                    <div className="form-col" style={{ maxWidth: 340 }}>
+                      <label>Entwurfs-Profil*</label>
+                      <SingleProfileSelect value={row.draft_profile_id ?? ""} onChange={(id) => patchStep(row.step, { draft_profile_id: id })} profiles={profiles} emptyLabel=" Profil wählen" />
                     </div>
-                    <div className="form-col" style={{ minWidth: 260 }}>
-                      <label>Verfeinerungs-Profil* (anklicken)</label>
-                      <SingleProfileChips value={row.refiner_profile_id ?? ""} onChange={(id) => patchStep(row.step, { refiner_profile_id: id })} profiles={profiles} emptyLabel="Profil wählen" />
+                    <div className="form-col" style={{ maxWidth: 340 }}>
+                      <label>Verfeinerungs-Profil*</label>
+                      <SingleProfileSelect value={row.refiner_profile_id ?? ""} onChange={(id) => patchStep(row.step, { refiner_profile_id: id })} profiles={profiles} emptyLabel=" Profil wählen" />
                     </div>
-                    <div className="form-col" style={{ minWidth: 260 }}>
+                    <div className="form-col" style={{ maxWidth: 340 }}>
                       <label>Checker (optional)</label>
-                      <SingleProfileChips value={row.checker_profile_id ?? ""} onChange={(id) => patchStep(row.step, { checker_profile_id: id })} profiles={profiles} emptyLabel="kein Checker" />
+                      <SingleProfileSelect value={row.checker_profile_id ?? ""} onChange={(id) => patchStep(row.step, { checker_profile_id: id })} profiles={profiles} emptyLabel="kein Checker" />
                     </div>
-                    <div className="form-col" style={{ maxWidth: 130 }}>
+                    <div className="form-col" style={{ flex: "1 1 140px", maxWidth: 160 }}>
                       <label>Zielsprache</label>
                       <input value={row.target_language ?? "German"} onChange={(event) => patchStep(row.step, { target_language: event.target.value })} />
                     </div>
-                    <div className="form-col" style={{ maxWidth: 110 }}>
+                    <div className="form-col" style={{ flex: "1 1 120px", maxWidth: 140 }}>
                       <label>Wörter/Block</label>
                       <input type="number" min={50} step={25} value={row.batch_words ?? 250} onChange={(event) => patchStep(row.step, { batch_words: Number(event.target.value) })} />
+                    </div>
+                    <div className="form-col" style={{ flex: "1 1 260px", maxWidth: 400 }}>
+                      <label>Stil-Probe (optional)</label>
+                      <input value={row.style_probe ?? ""} onChange={(event) => patchStep(row.step, { style_probe: event.target.value })} />
                     </div>
                   </>
                 ) : null}
                 {row.kind !== "outline" && row.kind !== "write" && row.kind !== "translate" ? (
-                  <div className="form-col" style={{ minWidth: 320 }}>
+                  <div className="form-col" style={{ maxWidth: 340 }}>
                     <label>Kandidaten-Profile* {candidateCount >= 2 ? "(Ensemble)" : ""}</label>
-                    <CandidatePicker ids={row.candidate_profile_ids ?? []} onChange={(ids) => patchStep(row.step, { candidate_profile_ids: ids })} profiles={profiles} />
+                    <CandidateSelect ids={row.candidate_profile_ids ?? []} onChange={(ids) => patchStep(row.step, { candidate_profile_ids: ids })} profiles={profiles} />
                   </div>
                 ) : null}
                 {row.kind !== "outline" && row.kind !== "write" && row.kind !== "translate" ? (
-                  <div className="form-col" style={{ minWidth: 260 }}>
-                    <label>Judge (optional, anklicken)</label>
-                    <SingleProfileChips value={row.judge_profile_id ?? ""} onChange={(id) => patchStep(row.step, { judge_profile_id: id })} profiles={profiles} emptyLabel="kein Judge — Kandidat 1 gewinnt" />
+                  <div className="form-col" style={{ maxWidth: 340 }}>
+                    <label>Judge (optional)</label>
+                    <SingleProfileSelect value={row.judge_profile_id ?? ""} onChange={(id) => patchStep(row.step, { judge_profile_id: id })} profiles={profiles} emptyLabel="kein Judge — Kandidat 1 gewinnt" />
                   </div>
                 ) : null}
               </div>
 
               {row.kind === "outline_refine" || row.kind === "text_refine" || row.kind === "translate_refine" ? (
-                <div className="form-row">
-                  <div className="form-col" style={{ maxWidth: 150 }}>
+                <div className="wizard-grid">
+                  <div className="form-col" style={{ flex: "1 1 150px", maxWidth: 150 }}>
                     <label>Verfeinerungsrunden</label>
                     <select value={String(row.refine_rounds ?? 1)} onChange={(event) => patchStep(row.step, { refine_rounds: Number(event.target.value) })}>
                       <option value="1">1 (nur Entwurf)</option>
@@ -506,29 +494,29 @@ function WizardConfigScreen({
                       <option value="3">3</option>
                     </select>
                   </div>
-                  <div className="form-col" style={{ maxWidth: 150 }}>
+                  <div className="form-col" style={{ flex: "1 1 150px", maxWidth: 150 }}>
                     <label>Semantik-Stopp (0.5–1.0)</label>
                     <input type="number" min={0.5} max={1} step={0.01} value={row.similarity_stop ?? 0.95} onChange={(event) => patchStep(row.step, { similarity_stop: Number(event.target.value) })} />
                   </div>
                   {row.kind === "outline_refine" ? (
-                    <div className="form-col" style={{ maxWidth: 160 }}>
+                    <div className="form-col" style={{ flex: "1 1 160px", maxWidth: 160 }}>
                       <label>Vorige Briefe (Kontext)</label>
                       <input type="number" min={0} max={50} value={row.context_prev ?? 3} onChange={(event) => patchStep(row.step, { context_prev: Number(event.target.value) })} />
                     </div>
                   ) : null}
                   {row.kind === "text_refine" ? (
                     <>
-                      <div className="form-col" style={{ maxWidth: 150 }}>
+                      <div className="form-col" style={{ flex: "1 1 150px", maxWidth: 150 }}>
                         <label>Entwurfs-Temperatur</label>
                         <input type="number" min={0} max={2} step={0.05} value={row.draft_temperature ?? 0.7} onChange={(event) => patchStep(row.step, { draft_temperature: Number(event.target.value) })} />
                       </div>
-                      <div className="form-col">
+                      <div className="form-col" style={{ flex: "1 1 260px", maxWidth: 400 }}>
                         <label>Stil-Probe (optional)</label>
                         <input value={row.style_probe ?? ""} onChange={(event) => patchStep(row.step, { style_probe: event.target.value })} />
                       </div>
                     </>
                   ) : null}
-                  <div className="form-col" style={{ maxWidth: 260 }}>
+                  <div className="form-col" style={{ flex: "1 1 220px", maxWidth: 280 }}>
                     <label>&nbsp;</label>
                     <label style={{ display: "flex", gap: 7, alignItems: "center", color: "var(--text)" }}>
                       <input
@@ -541,12 +529,6 @@ function WizardConfigScreen({
                       {candidateCount < 2 ? <span className="muted">(erst ab 2 Kandidaten)</span> : null}
                     </label>
                   </div>
-                </div>
-              ) : null}
-              {row.kind === "translate" ? (
-                <div className="form-col">
-                  <label>Stil-Probe (optional)</label>
-                  <input value={row.style_probe ?? ""} onChange={(event) => patchStep(row.step, { style_probe: event.target.value })} />
                 </div>
               ) : null}
             </div>
@@ -618,9 +600,9 @@ function WizardConfigEditor({
     key: keyof WizardStepConfig,
     label: string,
   ) => (
-    <div className="form-col" style={{ minWidth: 320 }}>
+    <div className="form-col" style={{ minWidth: 220 }}>
       <label>{label}</label>
-      <SingleProfileChips
+      <SingleProfileSelect
         value={String((merged(step) as any)[key] ?? "")}
         onChange={(id) => setField(step, key as string, id)}
         profiles={profiles}
@@ -633,16 +615,16 @@ function WizardConfigEditor({
     const row = merged(step);
     return (
       <>
-        <div className="form-col" style={{ minWidth: 320 }}>
+        <div className="form-col" style={{ minWidth: 240 }}>
           <label>Kandidaten (Schritt läuft über alle, Judge gewinnt)</label>
-          <CandidatePicker
+          <CandidateSelect
             ids={(row as any).candidate_profile_ids ?? []}
             onChange={(ids) => setField(step, "candidate_profile_ids", ids)}
             profiles={profiles}
           />
         </div>
         {singleField(step, "judge_profile_id" as keyof WizardStepConfig, "Judge")}
-        <div className="form-col" style={{ minWidth: 110 }}>
+        <div className="form-col" style={{ flex: "1 1 150px", maxWidth: 150 }}>
           <label>Runden</label>
           <input
             type="number"
@@ -657,7 +639,7 @@ function WizardConfigEditor({
             }}
           />
         </div>
-        <div className="form-col" style={{ minWidth: 120 }}>
+        <div className="form-col" style={{ flex: "1 1 260px", maxWidth: 360 }}>
           <label>Parallel-Blöcke</label>
           <input
             type="number"
@@ -734,8 +716,8 @@ function WizardConfigEditor({
           const dirty = (draft[row.step] ?? {}) as Record<string, unknown>;
           const isDirty = Object.keys(dirty).length > 0;
           return (
-            <div key={row.step} className="form-row" style={{ alignItems: "baseline" }}>
-              <div className="form-col" style={{ minWidth: 190 }}>
+            <div key={row.step} className="wizard-config-step">
+              <div className="wizard-config-head">
                 <strong style={{ fontSize: 12.5 }}>
                   S{row.step} · {wizardStepLabel(row.step)}
                   {isDirty ? " *" : ""}
@@ -745,7 +727,7 @@ function WizardConfigEditor({
                   {stepStatus === "done" ? " · erledigt — Retry nötig" : ""}
                 </span>
               </div>
-              {fieldsFor(row.step, row.kind)}
+              <div className="wizard-grid">{fieldsFor(row.step, row.kind)}</div>
             </div>
           );
         })}

@@ -2,7 +2,7 @@
 import Chart from "chart.js/auto";
 import type { ChartConfiguration } from "chart.js";
 import { api } from "../api";
-import type { Book, Stats } from "../types";
+import type { Book, OutlineChapter, Stats } from "../types";
 
 function useChart(id: string, config: ChartConfiguration | null) {
   const ref = useRef<HTMLCanvasElement>(null);
@@ -32,7 +32,7 @@ function PresenceTimeline({
       <div className="card">
         <strong>{title}</strong>
         <div className="muted" style={{ fontSize: 12 }}>
-          No entries yet â€” add characters/settings in the Codex tab.
+          No entries yet — add characters/settings in the Codex tab.
         </div>
       </div>
     );
@@ -47,7 +47,7 @@ function PresenceTimeline({
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
         <strong>{title}</strong>
         <span className="muted" style={{ fontSize: 12 }}>
-          â–² first appearance Â· â–¼ last chapter Â· bar intensity = mentions
+          ▲ first appearance · ▼ last chapter · bar intensity = mentions
         </span>
       </div>
       <div className="timeline" style={{ marginTop: 10 }}>
@@ -62,11 +62,11 @@ function PresenceTimeline({
           const first = row.first_chapter;
           return (
             <div key={row.name} className="timeline-row">
-              <div className="timeline-label" title={row.name + (showRoles && (row as any).role ? ` â€” ${(row as any).role}` : "")}>
+              <div className="timeline-label" title={row.name + (showRoles && (row as any).role ? ` — ${(row as any).role}` : "")}>
                 {color && <span className="legend-swatch" style={{ background: color }} />}
                 {row.name}
                 <span className="muted" style={{ marginLeft: 4, fontSize: 10.5 }}>
-                  {row.total_mentions}Ã—
+                  {row.total_mentions}×
                 </span>
               </div>
               <div className="timeline-cells">
@@ -130,7 +130,7 @@ function ThreadsChart({ threads, maxChapters }: { threads: Stats["threads"]; max
       <div className="legend">
         <span>
           <span className="legend-swatch" style={{ background: "var(--accent)" }} />
-          resolved thread (opened â†’ resolved)
+          resolved thread (opened → resolved)
         </span>
         <span>
           <span className="legend-swatch" style={{ background: "var(--warn)" }} />
@@ -155,11 +155,11 @@ function ThreadsChart({ threads, maxChapters }: { threads: Stats["threads"]; max
                   <div
                     className={`threads-bar ${resolved == null ? "open" : ""}`}
                     style={{ left: `${left}%`, width: `${Math.max(2, right - left)}%` }}
-                    title={`opened in ch ${opened}${resolved != null ? `, resolved in ch ${resolved}` : " â€” still open"}`}
+                    title={`opened in ch ${opened}${resolved != null ? `, resolved in ch ${resolved}` : " — still open"}`}
                   />
                 </div>
                 <div className="muted" style={{ width: 110, fontSize: 11 }}>
-                  ch {opened}{resolved != null ? ` â†’ ${resolved}` : " â†’ ?"}
+                  ch {opened}{resolved != null ? ` → ${resolved}` : " → ?"}
                 </div>
               </div>
             );
@@ -181,93 +181,88 @@ function ConceptGraph({ book }: { book: Book }) {
       </div>
     );
   }
-  const acts = outline.act_sections?.length ? outline.act_sections : [];
+  const acts = outline.act_sections ?? [];
   const chapters = outline.chapters;
   const codex = book.codex ?? { characters: [], settings: [], lore: [] };
-  const chaptersPerAct = acts.length ? Math.ceil(chapters.length / acts.length) : 0;
-  const width = Math.max(900, chapters.length * 46);
-  const height = 210 + (acts.length ? 90 : 0);
-  const chapterX = (index: number) => 60 + index * (width - 120) / Math.max(1, chapters.length - 1);
+  const written = book.chapters_written ?? 0;
+  const perAct = acts.length ? Math.ceil(chapters.length / acts.length) : 0;
+
+  const involved = (chapter: OutlineChapter) =>
+    codex.characters.filter((c) => {
+      if (!c.name) return false;
+      const haystack = `${chapter.name || ""} ${chapter.description || ""}`.toLowerCase();
+      return [c.name, ...(c.aliases ?? [])].some((alias) => alias && haystack.includes(alias.toLowerCase()));
+    });
+
+  const chip = (chapter: OutlineChapter) => {
+    const chars = involved(chapter);
+    const shown = chars.slice(0, 5);
+    const extra = chars.length - shown.length;
+    const isWritten = chapter.id <= written;
+    return (
+      <div
+        key={chapter.id}
+        className={`concept-chip${isWritten ? " written" : ""}`}
+        title={`Chapter ${chapter.id + 1}: ${chapter.name}\n\n${chapter.description}${
+          chars.length ? `\n\nCharacters: ${chars.map((c) => c.name).join(", ")}` : ""
+        }`}
+      >
+        <div className="concept-chip-top">
+          <span className="concept-chip-num">#{chapter.id + 1}</span>
+          <span className="concept-chip-name">{chapter.name || "—"}</span>
+        </div>
+        {shown.length ? (
+          <div className="concept-chip-dots">
+            {shown.map((c, i) => (
+              <span key={i} className="concept-dot" style={{ background: c.color || "#7c9cff" }} title={c.name} />
+            ))}
+            {extra > 0 ? (
+              <span className="muted" style={{ fontSize: 10 }}>
+                +{extra}
+              </span>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+    );
+  };
 
   return (
     <div className="card">
-      <strong>Book concept</strong>
-      <div className="inline-note">Premise â†’ acts â†’ chapters with the characters involved (from codex + mentions).</div>
-      <svg className="concept-svg" viewBox={`0 0 ${width} ${height}`} height={height}>
-        {(() => {
-          const parts: JSX.Element[] = [];
-          const premY = 36;
-          const actY = 110;
-          const chY = 200;
-          parts.push(
-            <g key="premise">
-              <rect x={60} y={premY - 22} width={190} height={44} rx={8} fill="#20293a" stroke="#7c9cff" />
-              <text className="node-title" x={72} y={premY - 4}>
-                PREMISE
-              </text>
-              <text className="node-sub" x={72} y={premY + 12}>
-                {(outline.premise ?? "").slice(0, 42)}â€¦
-              </text>
-            </g>,
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", flexWrap: "wrap", gap: 6 }}>
+        <strong>Book concept</strong>
+        <span className="muted" style={{ fontSize: 12 }}>
+          chapter plan — green = written · dots = characters (name/aliases in chapter text)
+        </span>
+      </div>
+      {outline.premise ? (
+        <div className="concept-premise" title={outline.premise}>
+          {outline.premise.length > 200 ? `${outline.premise.slice(0, 200)}…` : outline.premise}
+        </div>
+      ) : null}
+      {acts.length ? (
+        acts.map((act, i) => {
+          const slice = chapters.slice(i * perAct, (i + 1) * perAct);
+          if (!slice.length) return null;
+          return (
+            <div key={i} className="concept-act">
+              <div className="concept-act-title">
+                <strong>
+                  Act {i + 1}:{act.title || "—"}
+                </strong>
+                <span className="muted" style={{ fontSize: 11 }}>
+                  chapters {slice[0].id + 1}–{slice[slice.length - 1].id + 1}
+                </span>
+              </div>
+              <div className="concept-chapters">{slice.map(chip)}</div>
+            </div>
           );
-          if (acts.length) {
-            acts.forEach((act, i) => {
-              const x = 60 + (i * (width - 300)) / Math.max(1, acts.length - 1) + 120;
-              parts.push(
-                <line key={`e-p-${i}`} className="edge" x1={250} y1={premY} x2={x} y2={actY - 14} />,
-                <g key={`a-${i}`}>
-                  <rect x={x - 80} y={actY - 18} width={170} height={40} rx={8} fill="#20293a" stroke="#39415a" />
-                  <text className="node-title" x={x - 70} y={actY - 2}>
-                    ACT {i + 1}: {(act.title ?? "").slice(0, 22)}
-                  </text>
-                  <text className="node-sub" x={x - 70} y={actY + 14}>
-                    chapters {i * chaptersPerAct}â€“{Math.min(chapters.length, (i + 1) * chaptersPerAct) - 1}
-                  </text>
-                </g>,
-              );
-            });
-          }
-          chapters.forEach((chapter, i) => {
-            const x = chapterX(i);
-            if (acts.length) {
-              const actIndex = Math.min(acts.length - 1, Math.floor(i / chaptersPerAct));
-              const ax = 60 + (actIndex * (width - 300)) / Math.max(1, acts.length - 1) + 120;
-              parts.push(<line key={`e-c-${i}`} className="edge" x1={ax} y1={actY + 22} x2={x} y2={chY - 16} />);
-            } else {
-              parts.push(<line key={`e-c-${i}`} className="edge" x1={250} y1={premY} x2={x} y2={chY - 16} />);
-            }
-            const involved = codex.characters.filter((c) => c.name && chapter.description.toLowerCase().includes(c.name.toLowerCase()));
-            parts.push(
-              <g key={`c-${i}`}>
-                <circle cx={x} cy={chY} r={13} fill="#121820" stroke={chapter.id <= (book.chapters_written ?? 0) ? "#3ecf8e" : "#39415a"} strokeWidth={2} />
-                <text className="node-text" x={x} y={chY + 4} textAnchor="middle">
-                  {chapter.id}
-                </text>
-                {involved.map((char, k) => (
-                  <text
-                    key={k}
-                    className="node-sub"
-                    x={x}
-                    y={chY - 20}
-                    textAnchor="middle"
-                    fill={char.color || "#9aa3b2"}
-                  >
-                    â—
-                  </text>
-                ))}
-              </g>,
-            );
-            if (i % Math.max(1, Math.round(chapters.length / 24)) === 0 || i === chapters.length - 1) {
-              parts.push(
-                <text key={`ct-${i}`} className="node-sub" x={x} y={chY + 30} textAnchor="middle">
-                  {(chapter.name ?? "").slice(0, 16)}
-                </text>,
-              );
-            }
-          });
-          return parts;
-        })()}
-      </svg>
+        })
+      ) : (
+        <div className="concept-chapters" style={{ marginTop: 8 }}>
+          {chapters.map(chip)}
+        </div>
+      )}
     </div>
   );
 }
@@ -370,7 +365,7 @@ export default function StatsTab({ book, showToast }: { book: Book; showToast: (
   const costRef = useChart("cost", costConfig);
 
   if (!stats) {
-    return <div className="card muted">Loading statisticsâ€¦</div>;
+    return <div className="card muted">Loading statistics…</div>;
   }
 
   return (

@@ -574,26 +574,25 @@ tools\\bbm-venv\\Scripts\\pip install -e tools/bilingual_book_maker`}
             <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
               <div className="form-col" style={{ minWidth: 300 }}>
                 <label>Candidate profiles (translate every block)</label>
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                <select
+                  multiple
+                  size={Math.min(Math.max(profiles.length, 3), 7)}
+                  value={Array.from(candidates)}
+                  style={{ width: "100%" }}
+                  onChange={(e) =>
+                    setCandidates(new Set(Array.from(e.target.selectedOptions, (o) => o.value)))
+                  }
+                  disabled={busy}
+                >
                   {profiles.map((p) => (
-                    <label key={p.id} className="chip" style={{ cursor: "pointer", color: candidates.has(p.id) ? "inherit" : "var(--muted)" }}>
-                      <input
-                        type="checkbox"
-                        checked={candidates.has(p.id)}
-                        onChange={() =>
-                          setCandidates((prev) => {
-                            const next = new Set(prev);
-                            if (next.has(p.id)) next.delete(p.id);
-                            else next.add(p.id);
-                            return next;
-                          })
-                        }
-                        disabled={busy}
-                      />{" "}
+                    <option key={p.id} value={p.id}>
                       {p.name} ({p.model})
-                    </label>
+                    </option>
                   ))}
-                </div>
+                </select>
+                <span className="muted" style={{ fontSize: 11 }}>
+                  {candidates.size} gewählt — Strg/⌘-Klick für mehrere
+                </span>
               </div>
               <div className="form-col" style={{ minWidth: 250 }}>
                 <label>Judge model (picks the winner per block)</label>

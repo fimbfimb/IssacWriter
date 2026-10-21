@@ -1,9 +1,12 @@
 import { useEffect, useState } from "react";
 import Library from "./pages/Library";
+import Login from "./pages/Login";
 import BookPage from "./pages/BookPage";
-import { api } from "./api";
+import { api, currentUser, setCurrentUser } from "./api";
+import type { StudioUser } from "./types";
 
 export default function App() {
+  const [user, setUser] = useState<StudioUser | null>(() => currentUser());
   const [bookId, setBookId] = useState<string | null>(null);
   const [bookTab, setBookTab] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
@@ -18,6 +21,14 @@ export default function App() {
     window.setTimeout(() => setToast(null), 2600);
   };
 
+  const logout = () => {
+    setCurrentUser(null);
+    setUser(null);
+    setBookId(null);
+  };
+
+  const initial = user?.name ? user.name.charAt(0).toUpperCase() : "?";
+
   return (
     <div className="app-shell">
       <div className="topbar">
@@ -25,11 +36,24 @@ export default function App() {
           Isaac<span>Writer</span>
         </h1>
         <div className="muted">Narrative State Tracking Studio</div>
+        {user && (
+          <div className="topbar-user">
+            <span className="login-avatar" title={user.name}>
+              {initial}
+            </span>
+            <span>{user.name}</span>
+            <button className="btn-ghost" onClick={logout}>
+              Logout
+            </button>
+          </div>
+        )}
       </div>
 
       {error && <div className="error-banner">{error}</div>}
 
-      {bookId ? (
+      {!user ? (
+        <Login onPicked={setUser} showToast={showToast} />
+      ) : bookId ? (
         <BookPage
           bookId={bookId}
           initialTab={bookTab as any}

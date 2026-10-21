@@ -1,7 +1,7 @@
 ﻿import { useEffect, useMemo, useRef, useState } from "react";
 import Chart from "chart.js/auto";
 import type { ChartConfiguration } from "chart.js";
-import { api } from "../api";
+import { api, userHeaders } from "../api";
 import type { Book, OutlineChapter, Stats } from "../types";
 
 function useChart(id: string, config: ChartConfiguration | null) {
@@ -437,7 +437,7 @@ export default function StatsTab({ book, showToast }: { book: Book; showToast: (
             onClick={async () => {
               setEpubBusy(true);
               try {
-                const response = await fetch(`/api/books/${book.id}/export/epub`);
+                const response = await fetch(`/api/books/${book.id}/export/epub`, { headers: userHeaders() });
                 if (!response.ok) {
                   let detail = response.statusText;
                   try {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import os
 import re
@@ -35,6 +36,7 @@ from ..llm.app_settings import (
     get_ollama_cloud_key,
     is_ollama_cloud_base,
     set_ollama_cloud_key,
+    set_request_user,
 )
 from ..llm.provider import LlmClient, LlmError, LlmProfile
 from ..llm.profiles import ProfileStore
@@ -51,6 +53,7 @@ from ..sequel import create_sequel_book, prepare_sequel
 from ..stats.mentions import build_stats, export_markdown, export_txt
 from ..store.codex import merge_extracted
 from ..store.project import BookStore
+from ..store.users import UserStore
 from ..wizard import state as wizard_state
 from ..wizard.engine import WizardRegistry
 from ..translation.authorial import AuthorialWriter
@@ -77,6 +80,52 @@ ROOT = Path(__file__).resolve().parents[2]
 DATA_ROOT = Path(os.environ.get("STORYFORGE_DATA") or ROOT / "data")
 FRONTEND_DIST = Path(os.environ.get("STORYFORGE_FRONTEND") or ROOT / "frontend" / "dist")
 
+USER_ID_HEADER = "x-user-id"
+_user_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("studio_user_id", default=None)
+
+
+class UserProfiles:
+    """ProfileStore facade over one profiles.json per user.
+
+    uid-bound operations (the profiles tab) hit ``store_for(uid)``. Lookups
+    by profile id/name without a uid in scope (wizard engine, report-driven
+    retranslation) scan every user's store — those ids come from configs the
+    same user built in their own session, and this is an intranet setup
+    without a security boundary by design.
+    """
+
+    def __init__(self, root: Path):
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._stores: Dict[str, ProfileStore] = {}
+
+    def store_for(self, user_id: str) -> ProfileStore:
+        if user_id not in self._stores:
+            self._stores[user_id] = ProfileStore(self.root / user_id / "profiles.json")
+        return self._stores[user_id]
+
+    def _stores_all(self) -> List[ProfileStore]:
+        rows = []
+        if self.root.exists():
+            for directory in sorted(self.root.iterdir()):
+                if directory.is_dir():
+                    rows.append(self.store_for(directory.name))
+        return rows
+
+    def get(self, profile_id: str) -> Optional[Dict[str, Any]]:
+        for store in self._stores_all():
+            profile = store.get(profile_id)
+            if profile is not None:
+                return profile
+        return None
+
+    def find_by_name(self, name: str) -> Optional[Dict[str, Any]]:
+        for store in self._stores_all():
+            profile = store.find_by_name(name)
+            if profile is not None:
+                return profile
+        return None
+
 
 class ProfileIn(BaseModel):
     name: str
@@ -97,6 +146,10 @@ class BookIn(BaseModel):
     language: str = "en"
     target_words: int = 10000
     genre_notes: str = ""
+
+
+class UserIn(BaseModel):
+    name: str
 
 
 class CodexEntry(BaseModel):
@@ -335,7 +388,23 @@ class LayoutIn(BaseModel):
 def create_app() -> FastAPI:
     app = FastAPI(title="IsaacWriter", version="0.1.0")
     store = BookStore(DATA_ROOT)
-    profiles = ProfileStore(DATA_ROOT / "profiles.json")
+    users = UserStore(DATA_ROOT / "users.json")
+
+    # intranet multiuser bootstrap: everyone without credentials gets a
+    # default identity; legacy books/profiles/settings are adopted by it, once.
+    _default_user = users.ensure_default()
+    store.assign_owner_all(_default_user["id"])
+    _legacy_profiles = DATA_ROOT / "profiles.json"
+    _legacy_profiles_target = DATA_ROOT / "users" / _default_user["id"] / "profiles.json"
+    if _legacy_profiles.exists() and not _legacy_profiles_target.exists():
+        _legacy_profiles_target.parent.mkdir(parents=True, exist_ok=True)
+        _legacy_profiles.replace(_legacy_profiles_target)
+    _legacy_settings = DATA_ROOT / "settings.json"
+    _legacy_settings_target = DATA_ROOT / "users" / _default_user["id"] / "settings.json"
+    if _legacy_settings.exists() and not _legacy_settings_target.exists():
+        _legacy_settings_target.parent.mkdir(parents=True, exist_ok=True)
+        _legacy_settings.replace(_legacy_settings_target)
+    profiles = UserProfiles(DATA_ROOT / "users")
     runners = RunnerRegistry(store)
     translations = TranslationRegistry(store)
     refines = RefineRegistry(store)
@@ -351,16 +420,58 @@ def create_app() -> FastAPI:
         german_refines,
     )
 
+    def current_user_id() -> str:
+        uid = _user_id_var.get()
+        return uid or _default_user["id"]
+
+    class _UserHeaderMiddleware:
+        """Passwordless identity: the frontend sends the chosen user id in
+        X-User-Id for every call. No header → default user (zero-config, keeps
+        tools/tests working). Unknown id → 401 so stale browser tabs get sent
+        back to the login screen. Pure ASGI (not BaseHTTPMiddleware) so the
+        contextvar reaches every endpoint, including threadpool handlers."""
+
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] == "http":
+                headers = {
+                    key.decode("latin-1").lower(): value.decode("latin-1")
+                    for key, value in scope.get("headers") or []
+                }
+                uid = headers.get(USER_ID_HEADER)
+                if not uid:
+                    # EventSource cannot set headers — SSE falls back to ?user=
+                    from urllib.parse import parse_qs
+
+                    params = parse_qs((scope.get("query_string") or b"").decode("latin-1"))
+                    uid = (params.get("user") or [None])[0]
+                if not uid:
+                    uid = _default_user["id"]
+                elif users.get(uid) is None:
+                    await JSONResponse({"detail": f"unknown user '{uid}'"}, status_code=401)(scope, receive, send)
+                    return
+                _user_id_var.set(uid)
+                # the llm layer resolves keys (translations runner etc.) from its own pin
+                set_request_user(uid)
+            await self.wrapped(scope, receive, send)
+
+    app.add_middleware(_UserHeaderMiddleware)
+
     def get_book_or_404(book_id: str) -> Dict[str, Any]:
         try:
-            return store.load_book(book_id)
+            book = store.load_book(book_id)
         except FileNotFoundError:
             raise HTTPException(404, f"book {book_id} not found")
+        if book.get("owner_id") != current_user_id():
+            raise HTTPException(404, f"book {book_id} not found")
+        return book
 
     def profile_or_404(profile_id: Optional[str]) -> Optional[Dict[str, Any]]:
         if profile_id is None:
             return None
-        profile = profiles.get(profile_id)
+        profile = profiles.store_for(current_user_id()).get(profile_id)
         if profile is None:
             raise HTTPException(404, f"profile {profile_id} not found")
         return profile
@@ -368,6 +479,18 @@ def create_app() -> FastAPI:
     @app.get("/api/health")
     def health():
         return {"ok": True, "app": "IsaacWriter"}
+
+    @app.get("/api/users")
+    def list_users():
+        return {"users": users.list()}
+
+    @app.post("/api/users")
+    def add_user(payload: UserIn):
+        try:
+            user = users.create(payload.name)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        return {"user": user}
 
     @app.get("/api/settings")
     def settings():
@@ -386,11 +509,11 @@ def create_app() -> FastAPI:
 
     @app.put("/api/settings")
     def put_settings(payload: AppSettingsIn):
-        """Global provider settings — currently the ONE Ollama Cloud API key.
+        """Per-user Ollama Cloud API key (the "global" fallback of THIS user).
 
-        Sent non-empty → the key is stored and applies to every Ollama Cloud
-        request from now on (read fresh per call). Sent empty → the key is
-        cleared. Omitted → nothing changes."""
+        Sent non-empty → stored for the calling user and governs all of their
+        Ollama Cloud requests from now on (read fresh per call). Sent empty →
+        key is cleared. Omitted → nothing changes."""
         if payload.ollama_cloud_api_key is None:
             return {"ollama_cloud_api_key_set": bool(get_ollama_cloud_key().strip())}
         set_ollama_cloud_key(payload.ollama_cloud_api_key)
@@ -398,28 +521,29 @@ def create_app() -> FastAPI:
 
     @app.get("/api/profiles")
     def list_profiles():
-        return {"profiles": profiles.list()}
+        return {"profiles": profiles.store_for(current_user_id()).list()}
 
     @app.post("/api/profiles")
     def create_profile(payload: ProfileIn):
-        profile = profiles.create(payload.model_dump())
-        return {"profile": profiles.safe(profile)}
+        profile = profiles.store_for(current_user_id()).create(payload.model_dump())
+        return {"profile": ProfileStore.safe(profile)}
 
     @app.patch("/api/profiles/{profile_id}")
     def update_profile(profile_id: str, payload: ProfileIn):
+        uid = current_user_id()
         existing = profile_or_404(profile_id) or {}
         data = payload.model_dump()
         if not data.get("api_key"):
             data["api_key"] = existing.get("api_key", "")
         if data.get("extra_params") is None:
             data["extra_params"] = existing.get("extra_params", {})
-        profiles.update(profile_id, data)
-        return {"profile": profiles.safe(profiles.get(profile_id))}
+        profiles.store_for(uid).update(profile_id, data)
+        return {"profile": ProfileStore.safe(profiles.store_for(uid).get(profile_id))}
 
     @app.delete("/api/profiles/{profile_id}")
     def delete_profile(profile_id: str):
         profile_or_404(profile_id)
-        profiles.delete(profile_id)
+        profiles.store_for(current_user_id()).delete(profile_id)
         return {"ok": True}
 
     @app.get("/api/profiles/{profile_id}/models")
@@ -446,7 +570,7 @@ def create_app() -> FastAPI:
         typed_key = (payload.api_key or "").strip()
         api_key = typed_key if typed_key and typed_key != "***" else str(profile.get("api_key") or "")
         if not api_key and is_ollama_cloud_base(base_url):
-            # no per-profile/typed key — fall back to the ONE global Ollama
+            # no per-profile/typed key — fall back to the CALLING USER's global Ollama
             # Cloud key, freshly read (the LlmClient provider re-reads it per
             # request anyway)
             api_key = get_ollama_cloud_key().strip()
@@ -493,7 +617,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/books")
     def list_books():
-        rows = store.list_books()
+        rows = store.list_books(current_user_id())
         for row in rows:
             row["wizard"] = wizard_summary(row["id"])
         return {"books": rows}
@@ -506,6 +630,7 @@ def create_app() -> FastAPI:
             payload.language,
             payload.target_words,
             payload.genre_notes,
+            owner_id=current_user_id(),
         )
         return {"book": book}
 
@@ -1733,6 +1858,7 @@ def create_app() -> FastAPI:
             int(book_in.target_words),
             book_in.genre_notes or "",
             codex=codex,
+            owner_id=current_user_id(),
         )
         if (by_kind.get("outline") or {}).get("enabled", True):
             book["planner_profile_id"] = by_kind["outline"].get("planner_profile_id")
@@ -1765,7 +1891,9 @@ def create_app() -> FastAPI:
 
     @app.get("/api/wizards")
     def wizard_list():
-        return {"wizards": wizards.list_all()}
+        uid = current_user_id()
+        rows = [row for row in wizards.list_all() if store.book_owner(row["book_id"]) == uid]
+        return {"wizards": rows}
 
     @app.get("/api/books/{book_id}/wizard/state")
     def wizard_get_state(book_id: str):

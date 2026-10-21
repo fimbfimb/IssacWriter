@@ -75,6 +75,61 @@ button:disabled { opacity: 0.45; cursor: default; }
 }
 .topbar h1 span { color: var(--accent); }
 
+.topbar-user {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.login-avatar {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 700;
+  flex: 0 0 auto;
+}
+
+.login-wrap {
+  display: flex;
+  justify-content: center;
+  padding-top: 8vh;
+}
+
+.login-card {
+  width: 100%;
+  max-width: 520px;
+  padding: 24px;
+}
+
+.login-users {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.login-user {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-align: left;
+  padding: 10px 12px;
+}
+
+.login-user-name { font-weight: 600; }
+
+.login-create {
+  display: flex;
+  gap: 10px;
+}
+.login-create input { flex: 1; }
+
 .muted { color: var(--text-dim); }
 
 .card {

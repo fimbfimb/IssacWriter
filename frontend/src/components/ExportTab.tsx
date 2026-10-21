@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api } from "../api";
+import { api, userHeaders } from "../api";
 import type { Book } from "../types";
 
 function download(filename: string, content: string) {
@@ -27,7 +27,7 @@ export default function ExportTab({ book, showToast }: { book: Book; showToast: 
   const exportEnglishEpub = async () => {
     setEpubBusy(true);
     try {
-      const response = await fetch(`/api/books/${book.id}/export/epub`);
+      const response = await fetch(`/api/books/${book.id}/export/epub`, { headers: userHeaders() });
       if (!response.ok) {
         let detail = response.statusText;
         try {

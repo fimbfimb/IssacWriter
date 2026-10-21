@@ -11,17 +11,42 @@ import type {
   SequelProposal,
   StateCollection,
   Stats,
+  StudioUser,
   WizardState,
   WizardSummary,
 } from "./types";
 
 const BASE = "";
+const USER_KEY = "iw.current-user";
+
+export function currentUser(): StudioUser | null {
+  try {
+    const raw = localStorage.getItem(USER_KEY);
+    return raw ? (JSON.parse(raw) as StudioUser) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function setCurrentUser(user: StudioUser | null): void {
+  if (user) localStorage.setItem(USER_KEY, JSON.stringify(user));
+  else localStorage.removeItem(USER_KEY);
+}
+
+export function userHeaders(): Record<string, string> {
+  const user = currentUser();
+  return user ? { "X-User-Id": user.id } : {};
+}
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(BASE + path, {
-    headers: { "Content-Type": "application/json" },
-    ...options,
-  });
+  const headers = { "Content-Type": "application/json", ...userHeaders() };
+  const response = await fetch(BASE + path, { ...options, headers: { ...headers, ...((options as any)?.headers ?? {}) } });
+  if (response.status === 401) {
+    // stale/unknown user id (e.g. users wiped) — back to the login screen
+    setCurrentUser(null);
+    window.location.reload();
+    throw new Error("401: user unknown — please pick a user again");
+  }
   if (!response.ok) {
     let detail = response.statusText;
     try {
@@ -35,6 +60,10 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 
 export const api = {
   health: () => request<{ ok: boolean }>("/api/health"),
+
+  listUsers: () => request<{ users: StudioUser[] }>("/api/users"),
+  createUser: (name: string) =>
+    request<{ user: StudioUser }>("/api/users", { method: "POST", body: JSON.stringify({ name }) }),
   settings: () => request<Record<string, any>>("/api/settings"),
   saveOllamaKey: (key: string) =>
     request<{ ollama_cloud_api_key_set: boolean }>("/api/settings", {
@@ -195,7 +224,7 @@ export const api = {
   uploadIllustrationImage: (id: string, posId: string, file: File) => {
     const form = new FormData();
     form.append("file", file);
-    return fetch(`/api/books/${id}/layout/illustrations/${posId}/image`, { method: "POST", body: form }).then(
+    return fetch(`/api/books/${id}/layout/illustrations/${posId}/image`, { method: "POST", body: form, headers: userHeaders() }).then(
       async (response) => {
         if (!response.ok) {
           let detail = response.statusText;
@@ -218,7 +247,7 @@ export const api = {
   uploadCover: (id: string, file: File) => {
     const form = new FormData();
     form.append("file", file);
-    return fetch(`/api/books/${id}/layout/cover`, { method: "POST", body: form }).then(async (response) => {
+    return fetch(`/api/books/${id}/layout/cover`, { method: "POST", body: form, headers: userHeaders() }).then(async (response) => {
       if (!response.ok) {
         let detail = response.statusText;
         try {
@@ -293,6 +322,7 @@ export const api = {
   translateEpub: async (id: string, language: string) => {
     const response = await fetch(
       `/api/books/${id}/export/translation/epub${language ? `?language=${encodeURIComponent(language)}` : ""}`,
+      { headers: userHeaders() },
     );
     if (!response.ok) {
       let detail = response.statusText;
@@ -611,7 +641,8 @@ export const api = {
 };
 
 export function openEventStream(bookId: string, onEvent: (event: any) => void): () => void {
-  const source = new EventSource(`${BASE}/api/books/${bookId}/events`);
+  const user = currentUser();
+  const source = new EventSource(`${BASE}/api/books/${bookId}/events${user ? `?user=${encodeURIComponent(user.id)}` : ""}`);
   source.onmessage = (message) => {
     try {
       onEvent(JSON.parse(message.data));

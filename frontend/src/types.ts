@@ -413,3 +413,8 @@ export type WizardSummary = {
   created: string | null;
   updated: string | null;
 };
+export type StudioUser = {
+  id: string;
+  name: string;
+  created: string;
+};

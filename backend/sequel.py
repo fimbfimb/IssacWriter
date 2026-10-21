@@ -265,6 +265,7 @@ def create_sequel_book(
             "settings": list(codex.get("settings") or []),
             "lore": list(codex.get("lore") or []),
         },
+        owner_id=book.get("owner_id"),
     )
     store.set_author_notes(new_book["id"], "\n\n".join(notes_parts))
     return store.load_book(new_book["id"])

@@ -58,6 +58,7 @@ class BookStore:
         target_words: int,
         genre_notes: str = "",
         codex: Optional[Dict[str, Any]] = None,
+        owner_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         book_id = uuid.uuid4().hex[:12]
         directory = self.root / book_id
@@ -67,6 +68,7 @@ class BookStore:
         book = {
             "schema": SCHEMA_VERSION,
             "id": book_id,
+            "owner_id": owner_id,
             "title": title or "Untitled Book",
             "story_prompt": story_prompt,
             "genre_notes": genre_notes,
@@ -94,7 +96,8 @@ class BookStore:
             raise FileNotFoundError(f"book {book_id} not found")
         return book
 
-    def list_books(self) -> List[Dict[str, Any]]:
+    def list_books(self, owner_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Books for one owner; ``owner_id=None`` lists everything (legacy/tools)."""
         books = []
         if not self.root.exists():
             return books
@@ -102,16 +105,18 @@ class BookStore:
             meta = _read_json(directory / "book.json")
             if meta is None:
                 continue
+            if owner_id is not None and meta.get("owner_id") != owner_id:
+                continue
             total_words, chapters_written = self.book_progress(meta["id"])
             books.append(
                 {
                     "id": meta["id"],
                     "title": meta["title"],
-                    "language": meta["language"],
-                    "target_words": meta["target_words"],
-                    "status": meta["status"],
-                    "created": meta["created"],
-                    "updated": meta["updated"],
+                    "language": meta.get("language") or "en",
+                    "target_words": meta.get("target_words") or 0,
+                    "status": meta.get("status") or "empty",
+                    "created": meta.get("created") or "",
+                    "updated": meta.get("updated") or "",
                     "chapters_written": chapters_written,
                     "words_written": total_words,
                 }
@@ -122,6 +127,27 @@ class BookStore:
     def delete_book(self, book_id: str) -> None:
         directory = self._book_dir(book_id)
         shutil.rmtree(directory)
+
+    def assign_owner_all(self, owner_id: str) -> int:
+        """One-shot migration: give every book without an owner to ``owner_id``."""
+        changed = 0
+        if not self.root.exists():
+            return changed
+        for directory in sorted(self.root.iterdir()):
+            meta = _read_json(directory / "book.json")
+            if meta is None or meta.get("owner_id"):
+                continue
+            meta["owner_id"] = owner_id
+            directory.joinpath("book.json").parent.mkdir(parents=True, exist_ok=True)
+            _write_json(directory / "book.json", meta)
+            changed += 1
+        return changed
+
+    def book_owner(self, book_id: str) -> Optional[str]:
+        try:
+            return self.load_book(book_id).get("owner_id")
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return None
 
     def outline_exists(self, book_id: str) -> bool:
         return self.load_book(book_id).get("outline") is not None
